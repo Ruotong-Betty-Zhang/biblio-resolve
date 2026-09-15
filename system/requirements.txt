@@ -1,0 +1,11 @@
+requests
+customtkinter
+pandas
+openpyxl
+rapidfuzz
+langdetect
+pypdf
+PyMuPDF
+pytesseract
+numpy
+sentence-transformers

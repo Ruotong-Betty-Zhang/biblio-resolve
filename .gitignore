@@ -1,0 +1,44 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+system/app_settings.json
+
+# Lookup and verification caches
+doi_lookup_cache*.json
+system/lookup_cache.json
+system/verification_cache.json
+system/abstract_cache.jsonl
+
+# Research datasets and generated tabular outputs
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.ris
+*.bib
+*.bibtex
+
+# Documents supplied or generated during the research workflow
+*.pdf
+*.doc
+*.docx
+
+# Local working and build directories
+.codex_spreadsheet_work/
+.codex_work_url_lookup/
+tmp/
+outputs/
+build/
+dist/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.log
