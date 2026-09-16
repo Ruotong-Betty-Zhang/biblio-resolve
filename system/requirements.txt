@@ -9,3 +9,4 @@ PyMuPDF
 pytesseract
 numpy
 sentence-transformers
+matplotlib

@@ -11,6 +11,8 @@ one module tag), sorted best-confidence-first. `first()` below is a small
 helper for tests that expect exactly one clean result.
 """
 
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -499,7 +501,7 @@ class IsspModuleTagsTests(unittest.TestCase):
             output_df, _stats, _tag_column = tagger.tag_issp_modules(
                 df, text_columns=["Title", "Abstract"], url_column="Url", doi_column="DOI",
                 use_network_doi_lookup=False, use_semantic_matching=False,
-                fetch_full_text=True, request_delay=0)
+                fetch_full_text=True, use_full_text_cache=False, request_delay=0)
 
         self.assertEqual(output_df.loc[0, "ISSP Module Tag"], "RELIG")
         self.assertEqual(output_df.loc[0, "ISSP Module Method"], "za_number")
@@ -516,7 +518,7 @@ class IsspModuleTagsTests(unittest.TestCase):
             output_df, _stats, _tag_column = tagger.tag_issp_modules(
                 df, text_columns=["Title", "Abstract"], url_column="Url", doi_column="DOI",
                 use_network_doi_lookup=False, use_semantic_matching=False,
-                fetch_full_text=True, request_delay=0)
+                fetch_full_text=True, use_full_text_cache=False, request_delay=0)
         fetch_mock.assert_not_called()
         self.assertEqual(output_df.loc[0, "ISSP Full Text Fetch Status"], "no_link")
 
@@ -532,6 +534,89 @@ class IsspModuleTagsTests(unittest.TestCase):
                 fetch_full_text=False)
         fetch_mock.assert_not_called()
         self.assertEqual(output_df.loc[0, "ISSP Full Text Fetch Status"], "")
+
+    # --- full-text fetch cache ----------------------------------------------
+
+    def test_full_text_cache_key_distinguishes_url_and_page_count(self):
+        key_a = tagger.full_text_cache_key("https://example.org/a", 15)
+        key_a_again = tagger.full_text_cache_key("https://EXAMPLE.org/a", 15)  # canonicalized
+        key_b = tagger.full_text_cache_key("https://example.org/b", 15)
+        key_a_pages = tagger.full_text_cache_key("https://example.org/a", 3)
+        self.assertEqual(key_a, key_a_again)
+        self.assertNotEqual(key_a, key_b)
+        self.assertNotEqual(key_a, key_a_pages)
+
+    def test_cached_full_text_respects_ttl_for_success_vs_failure(self):
+        now = tagger.time.time()
+        cache = {
+            "fresh-success": {"saved_at": now, "payload": {"status": "abstract_found"}},
+            "old-success": {"saved_at": now - tagger.FULL_TEXT_SUCCESS_TTL - 10,
+                            "payload": {"status": "abstract_found"}},
+            "fresh-failure": {"saved_at": now, "payload": {"status": "fetch_failed"}},
+            "old-failure": {"saved_at": now - tagger.FULL_TEXT_FAILURE_TTL - 10,
+                           "payload": {"status": "fetch_failed"}},
+        }
+        self.assertIsNotNone(tagger.cached_full_text(cache, "fresh-success"))
+        self.assertIsNone(tagger.cached_full_text(cache, "old-success"))  # past the 180-day success TTL
+        self.assertIsNotNone(tagger.cached_full_text(cache, "fresh-failure"))
+        self.assertIsNone(tagger.cached_full_text(cache, "old-failure"))
+        self.assertIsNone(tagger.cached_full_text(cache, "missing-key"))
+
+    def test_tag_issp_modules_second_run_hits_cache_instead_of_refetching(self):
+        call_count = [0]
+
+        def fake_fetch_abstract(url, session=None, max_pdf_pages=3, **kwargs):
+            call_count[0] += 1
+            return {"status": "abstract_found", "abstract": "",
+                    "full_text": "Methods: we use ZA7570."}
+
+        df = pd.DataFrame({
+            "Title": ["Paper A"], "Abstract": ["No ISSP mention here."],
+            "Url": ["https://example.org/paper"], "DOI": [""],
+        })
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = os.path.join(directory, "full_text_cache.jsonl")
+            with mock.patch.object(tagger, "FULL_TEXT_CACHE_FILE", cache_path), \
+                 mock.patch.object(tagger.abstract_tools, "fetch_abstract",
+                                   side_effect=fake_fetch_abstract):
+                for _ in range(2):
+                    output_df, stats, _tag_column = tagger.tag_issp_modules(
+                        df, text_columns=["Title", "Abstract"], url_column="Url",
+                        doi_column="DOI", use_network_doi_lookup=False,
+                        use_semantic_matching=False, fetch_full_text=True,
+                        use_full_text_cache=True, request_delay=0)
+
+        self.assertEqual(call_count[0], 1)  # second run served entirely from cache
+        self.assertEqual(stats["full text served from cache"], 1)
+        self.assertEqual(stats["full text freshly fetched"], 0)
+        self.assertEqual(output_df.loc[0, "ISSP Module Tag"], "RELIG")
+
+    def test_tag_issp_modules_cache_disabled_always_refetches(self):
+        call_count = [0]
+
+        def fake_fetch_abstract(url, session=None, max_pdf_pages=3, **kwargs):
+            call_count[0] += 1
+            return {"status": "abstract_found", "abstract": "", "full_text": "Methods: ZA7570."}
+
+        df = pd.DataFrame({
+            "Title": ["Paper A"], "Abstract": ["No ISSP mention here."],
+            "Url": ["https://example.org/paper"], "DOI": [""],
+        })
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = os.path.join(directory, "full_text_cache.jsonl")
+            with mock.patch.object(tagger, "FULL_TEXT_CACHE_FILE", cache_path), \
+                 mock.patch.object(tagger.abstract_tools, "fetch_abstract",
+                                   side_effect=fake_fetch_abstract):
+                for _ in range(2):
+                    tagger.tag_issp_modules(
+                        df, text_columns=["Title", "Abstract"], url_column="Url",
+                        doi_column="DOI", use_network_doi_lookup=False,
+                        use_semantic_matching=False, fetch_full_text=True,
+                        use_full_text_cache=False, request_delay=0)
+
+        self.assertEqual(call_count[0], 2)  # cache disabled - both runs fetched fresh
 
 
 if __name__ == "__main__":

@@ -43,3 +43,19 @@ dist/
 Thumbs.db
 *.log
 /dataset/
+/tags/
+/url_and_doi/
+/verification test/
+/verification_comparison_outputs/
+
+/AI URL/
+/compare_two_csv_and_create_column.ipynb
+/doi_stats.ipynb
+/find_doi_url_fast.py
+/find_doi_url_fixed.py
+/find_missing_links.py
+/merge_back.py
+/sample_100_with_doi_url.py
+/split_by_status.py
+/status composition by publication year.png
+/verification/

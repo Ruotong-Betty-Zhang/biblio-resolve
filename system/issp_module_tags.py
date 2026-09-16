@@ -63,12 +63,20 @@ this one, check it", and "no idea, look yourself".
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import threading
 import time
 
 import requests
 
 import abstract_note_tools as abstract_tools
+
+try:  # Package import: python -m system.test_issp_module_tags
+    from . import lookup_core as core
+except ImportError:  # Direct app/script import from inside system/
+    import lookup_core as core
 
 clean_value = abstract_tools.clean_value
 guess_column = abstract_tools.guess_column
@@ -597,10 +605,68 @@ def replace_data_country_tags(value, new_tags):
     return _merge_tags(value, new_tags, lambda item: item.startswith("DATA - "))
 
 
+# ---------------------------------------------------------------------------
+# Full-text fetch cache: a separate file from abstract_cache.jsonl (Abstract
+# Finder's own cache) since this stores plain extracted text keyed only by
+# URL + page count, not the title/author/year-aware, source-lookup-aware
+# entries that feature uses. Same append-only JSONL pattern as the rest of
+# the project's caches so a crash mid-run only loses the last unflushed
+# line, not the whole file.
+# ---------------------------------------------------------------------------
+
+FULL_TEXT_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "full_text_cache.jsonl")
+_FULL_TEXT_CACHE_LOCK = threading.Lock()
+FULL_TEXT_CACHE_VERSION = "v1"
+FULL_TEXT_SUCCESS_TTL = 180 * 86400   # successfully fetched text rarely changes
+FULL_TEXT_FAILURE_TTL = 1 * 86400     # network hiccups/paywalls are worth retrying sooner
+
+
+def full_text_cache_key(link, max_pdf_pages):
+    payload = {"v": FULL_TEXT_CACHE_VERSION, "url": core._canonical_url(link),
+              "max_pdf_pages": max_pdf_pages}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def load_full_text_cache():
+    with _FULL_TEXT_CACHE_LOCK:
+        try:
+            with open(FULL_TEXT_CACHE_FILE, "r", encoding="utf-8") as stream:
+                cache = {}
+                for line in stream:
+                    try:
+                        entry = json.loads(line)
+                        cache[entry["key"]] = {"saved_at": entry["saved_at"], "payload": entry["payload"]}
+                    except (KeyError, TypeError, ValueError):
+                        continue  # a final partial line can remain after a sudden shutdown
+                return cache
+        except OSError:
+            return {}
+
+
+def cached_full_text(cache, key):
+    entry = cache.get(key)
+    if not entry:
+        return None
+    payload = entry.get("payload", {})
+    age = time.time() - float(entry.get("saved_at", 0))
+    ttl = FULL_TEXT_SUCCESS_TTL if payload.get("status") in {"abstract_found", "no_abstract_found"} \
+        else FULL_TEXT_FAILURE_TTL
+    return payload if age <= ttl else None
+
+
+def append_full_text_cache_entry(key, payload, saved_at=None):
+    """Checkpoint one completed fetch without rewriting the full cache."""
+    entry = {"key": key, "saved_at": saved_at or time.time(), "payload": payload}
+    with _FULL_TEXT_CACHE_LOCK:
+        with open(FULL_TEXT_CACHE_FILE, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            stream.flush()
+
+
 def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, tag_column=None,
                      use_network_doi_lookup=True, use_semantic_matching=True,
                      fetch_full_text=False, full_text_pdf_pages=15, request_delay=0.5,
-                     semantic_matcher=None, session=None,
+                     use_full_text_cache=True, semantic_matcher=None, session=None,
                      progress_callback=None, cancel_event=None):
     """Classify every record - possibly with more than one module tag each
     - and write the result into columns (semicolon-separated when there is
@@ -624,7 +690,11 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
     text is added to the search text for that one record before
     classification and country extraction, in addition to `text_columns`.
     This is a real network request per record with a URL/DOI - slow over
-    a large batch - so it is opt-in and fully respects `cancel_event`.
+    a large batch - so it is opt-in and fully respects `cancel_event`. A
+    successful fetch is cached (full_text_cache.jsonl, keyed by URL and
+    `full_text_pdf_pages`) for 180 days, and a failed one for 1 day, so a
+    second run - e.g. after tweaking the classifier - does not re-download
+    everything. Pass use_full_text_cache=False to force a fresh fetch.
 
     Independently of module classification, every record's search text
     (including any fetched full text) is scanned for ISSP member
@@ -643,8 +713,11 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
     if use_network_doi_lookup:
         session = session or requests.Session()
         doi_resolver = lambda doi: resolve_gesis_doi_title(doi, session=session)
+    full_text_cache = None
     if fetch_full_text:
         session = session or requests.Session()
+        if use_full_text_cache:
+            full_text_cache = load_full_text_cache()
 
     if tag_column is None:
         tag_column = guess_column(frame.columns, abstract_tools.TAG_ALIASES)
@@ -657,7 +730,8 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
         frame[column] = ""
 
     counts = {"Total records": len(frame), "high confidence": 0, "medium confidence": 0,
-              "low confidence": 0, "no match": 0, "Cancelled records": 0}
+              "low confidence": 0, "no match": 0, "Cancelled records": 0,
+              "full text served from cache": 0, "full text freshly fetched": 0}
     total = len(frame)
     indices = list(frame.index)
     texts, results, countries = {}, {}, {}
@@ -677,12 +751,22 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
         if fetch_full_text:
             link = abstract_tools.record_link(row, url_column, doi_column)
             if link:
-                fetch_result = abstract_tools.fetch_abstract(
-                    link, session=session, max_pdf_pages=full_text_pdf_pages)
+                cache_key = full_text_cache_key(link, full_text_pdf_pages) if full_text_cache is not None else None
+                cached = cached_full_text(full_text_cache, cache_key) if cache_key else None
+                if cached is not None:
+                    fetch_result = cached
+                    counts["full text served from cache"] += 1
+                else:
+                    fetch_result = abstract_tools.fetch_abstract(
+                        link, session=session, max_pdf_pages=full_text_pdf_pages)
+                    counts["full text freshly fetched"] += 1
+                    if request_delay:
+                        time.sleep(request_delay)
+                    if full_text_cache is not None:
+                        full_text_cache[cache_key] = {"saved_at": time.time(), "payload": fetch_result}
+                        append_full_text_cache_entry(cache_key, fetch_result)
                 frame.at[index, "ISSP Full Text Fetch Status"] = fetch_result.get("status", "")
                 parts.append(clean_value(fetch_result.get("full_text", "")))
-                if request_delay:
-                    time.sleep(request_delay)
             else:
                 frame.at[index, "ISSP Full Text Fetch Status"] = "no_link"
         text = "\n".join(part for part in parts if part)

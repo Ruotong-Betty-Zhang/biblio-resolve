@@ -42,15 +42,21 @@ from tkinter import Menu, filedialog, messagebox, simpledialog, ttk
 
 import customtkinter as ctk
 import pandas as pd
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 try:  # Package import: import system.literature_lookup
     from . import abstract_note_tools as abstract_tools
+    from . import compare_tools
     from . import issp_module_tags as issp_tags
     from . import lookup_core as core
+    from . import stats_tools
 except ImportError:  # Direct launch: python literature_lookup.py from system/
     import abstract_note_tools as abstract_tools
+    import compare_tools
     import issp_module_tags as issp_tags
     import lookup_core as core
+    import stats_tools
 
 
 def _resource_path(filename):
@@ -570,6 +576,13 @@ class ResultsTable(ctk.CTkFrame):
         self.copy_selected_cell()
         return "break"
 
+    def retitle(self, headers):
+        """Relabel the existing columns without rebuilding them — only valid
+        when the new headers are the same count as the table was built with."""
+        for index, header in enumerate(headers):
+            self.tree.heading(f"c{index}", text=header, anchor="w")
+        self.headers = list(headers)
+
 
 # ---------------------------------------------------------------------------
 # Main window
@@ -595,6 +608,8 @@ class App(ctk.CTk):
         note_links_tab = tabview.add("Note Link Recovery")
         tag_cleanup_tab = tabview.add("Keyword Cleanup")
         review_tab = tabview.add("Manual Review")
+        statistics_tab = tabview.add("Statistics")
+        compare_tab = tabview.add("Compare Documents")
         sources_tab = tabview.add("Sources")
         tabview.set("Single Lookup")
 
@@ -628,6 +643,12 @@ class App(ctk.CTk):
 
         self.review_page = ManualReviewPage(review_tab)
         self.review_page.pack(fill="both", expand=True)
+
+        self.statistics_page = StatisticsPage(statistics_tab)
+        self.statistics_page.pack(fill="both", expand=True)
+
+        self.compare_page = CompareDocumentsPage(compare_tab)
+        self.compare_page.pack(fill="both", expand=True)
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1016,55 @@ def _save_enriched_dataframe(parent, dataframe, source_path, suffix):
         messagebox.showerror("Export failed", f"Couldn't save the enriched file:\n{exc}")
         return
     messagebox.showinfo("Export complete", f"Saved to:\n{path}")
+
+
+def _export_table_rows(parent, rows, headers, default_name):
+    """Export an arbitrary computed table (stats counts, a diff table — not
+    a bibliography with a "same format as source" concept) to CSV or Excel."""
+    path = filedialog.asksaveasfilename(
+        title="Export table", defaultextension=".csv",
+        filetypes=[("CSV table (.csv)", "*.csv"), ("Excel (.xlsx)", "*.xlsx")],
+        initialfile=default_name)
+    if not path:
+        return
+    frame = pd.DataFrame(rows, columns=headers)
+    try:
+        if os.path.splitext(path)[1].casefold() == ".xlsx":
+            frame.to_excel(path, index=False)
+        else:
+            frame.to_csv(path, index=False, encoding="utf-8-sig")
+    except Exception as exc:
+        messagebox.showerror("Export failed", f"Couldn't save the file:\n{exc}")
+        return
+    messagebox.showinfo("Export complete", f"Saved to:\n{path}")
+
+
+def _chart_theme_colors():
+    """Background/text/accent colors so an embedded matplotlib chart doesn't
+    look like a bright white rectangle dropped into a dark-mode window."""
+    dark = ctk.get_appearance_mode() == "Dark"
+    return {
+        "figure_bg": "#242424" if dark else "#F5F5F5",
+        "axes_bg": "#242424" if dark else "#F5F5F5",
+        "text": "#E7E7E7" if dark else "#1B1B1B",
+        "grid": "#3A3A3A" if dark else "#D8D8D8",
+        "accent": "#3E92E8" if dark else "#0F6CBD",
+        "palette": ["#0F6CBD", "#3E92E8", "#66C2A5", "#FC8D62", "#8DA0CB",
+                    "#E78AC3", "#A6D854", "#FFD92F"],
+    }
+
+
+def _style_chart_axes(figure, axes):
+    colors = _chart_theme_colors()
+    figure.set_facecolor(colors["figure_bg"])
+    axes.set_facecolor(colors["axes_bg"])
+    axes.tick_params(colors=colors["text"], labelsize=8)
+    for spine in axes.spines.values():
+        spine.set_color(colors["grid"])
+    axes.title.set_color(colors["text"])
+    axes.xaxis.label.set_color(colors["text"])
+    axes.yaxis.label.set_color(colors["text"])
+    return colors
 
 
 # ---------------------------------------------------------------------------
@@ -3430,6 +3500,405 @@ class BatchLookupPage(ctk.CTkFrame):
             messagebox.showerror("Save failed", f"Couldn't save the file:\n{e}")
             return
         messagebox.showinfo("Saved", f"Results saved to:\n{path}")
+
+
+# ---------------------------------------------------------------------------
+# Statistics: local, flexible column-level charts/tables over any imported
+# bibliography file. See stats_tools.py for the (unit-tested) counting logic;
+# this class is just the chart/table wiring around it.
+# ---------------------------------------------------------------------------
+
+class StatisticsPage(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(master, fg_color="transparent")
+        self.df = None
+        self.file_path = None
+        self.current_rows = []
+        self.current_headers = []
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=4, pady=(6, 8))
+        ctk.CTkButton(top, text="Choose file…", width=130, command=self.on_choose_file).pack(side="left")
+        self.file_label = ctk.CTkLabel(top, text="Choose a CSV, Excel, or RIS file to summarize", anchor="w")
+        self.file_label.pack(side="left", padx=12, fill="x", expand=True)
+        self.export_chart_btn = ctk.CTkButton(top, text="Save chart…", width=110,
+                                              command=self.on_export_chart, state="disabled")
+        self.export_chart_btn.pack(side="right")
+        self.export_table_btn = ctk.CTkButton(top, text="Export table…", width=125,
+                                              command=self.on_export_table, state="disabled")
+        self.export_table_btn.pack(side="right", padx=(0, 6))
+
+        controls = ctk.CTkFrame(self)
+        controls.pack(fill="x", padx=4, pady=(0, 6))
+        ctk.CTkLabel(controls, text="Column", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.value_col = _make_searchable_combobox(controls, values=[NO_COLUMN], width=220,
+                                                    command=lambda _v: self.on_value_column_changed())
+        self.value_col.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+
+        ctk.CTkLabel(controls, text="Group by (optional)", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=1, sticky="w", padx=10, pady=(8, 2))
+        self.group_col = _make_searchable_combobox(controls, values=[NO_COLUMN], width=220)
+        self.group_col.set(NO_COLUMN)
+        self.group_col.grid(row=1, column=1, sticky="w", padx=10, pady=(0, 10))
+
+        ctk.CTkLabel(controls, text="Chart type", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=2, sticky="w", padx=10, pady=(8, 2))
+        self.chart_type = ctk.CTkOptionMenu(controls, values=["Table only"], width=150)
+        self.chart_type.grid(row=1, column=2, sticky="w", padx=10, pady=(0, 10))
+
+        self.generate_btn = ctk.CTkButton(controls, text="Generate", width=110,
+                                          command=self.on_generate, state="disabled")
+        self.generate_btn.grid(row=1, column=3, sticky="w", padx=10, pady=(0, 10))
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        self.overview_table = ResultsTable(
+            body, headers=["Column", "Kind", "Non-empty", "Unique values"], weights=[2, 0, 0, 0])
+        self.overview_table.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+
+        chart_frame = ctk.CTkFrame(body)
+        chart_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        self.figure = Figure(figsize=(5, 4), dpi=100)
+        self.axes = self.figure.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=chart_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
+        self._clear_chart("Pick a column above and click Generate.")
+
+        self.counts_table = ResultsTable(self, headers=["Value", "Count", "Percentage"], weights=[2, 0, 0])
+        self.counts_table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+
+    def on_choose_file(self):
+        path = filedialog.askopenfilename(
+            title="Choose a bibliographic file",
+            filetypes=[("Supported files", "*.csv *.xlsx *.xls *.json *.ris *.bib *.bibtex"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.df = core.read_records_file(path).reset_index(drop=True)
+        except Exception as exc:
+            messagebox.showerror("Couldn't read file", f"Failed to read this file:\n{exc}")
+            return
+        self.file_path = path
+        encoding = self.df.attrs.get("source_encoding")
+        self.file_label.configure(
+            text=f"{os.path.basename(path)} ({len(self.df):,} records)" + (f" · {encoding}" if encoding else ""))
+
+        columns = list(self.df.columns)
+        _update_combobox_values(self.value_col, columns)
+        _update_combobox_values(self.group_col, [NO_COLUMN] + columns)
+        self.group_col.set(NO_COLUMN)
+        if columns:
+            self.value_col.set(columns[0])
+            self.on_value_column_changed()
+        self.generate_btn.configure(state="normal" if columns else "disabled")
+        self.export_table_btn.configure(state="disabled")
+        self.export_chart_btn.configure(state="disabled")
+        self.counts_table.set_rows([])
+        self._show_overview()
+        self._clear_chart("Pick a column above and click Generate.")
+
+    def _show_overview(self):
+        rows = [(row["column"], row["kind"], f"{row['non_empty']:,} ({row['non_empty_pct']:.0%})",
+                 f"{row['unique_values']:,}") for row in stats_tools.summarize_columns(self.df)]
+        self.overview_table.set_rows(rows)
+
+    def on_value_column_changed(self):
+        column = self.value_col.get()
+        if self.df is None or column not in self.df.columns:
+            return
+        kind = stats_tools.classify_column(self.df[column], column)
+        chart_types = stats_tools.suggested_chart_types(kind)
+        self.chart_type.configure(values=chart_types)
+        self.chart_type.set(chart_types[0])
+
+    def _clear_chart(self, message):
+        self.axes.clear()
+        colors = _style_chart_axes(self.figure, self.axes)
+        self.axes.text(0.5, 0.5, message, ha="center", va="center", color=colors["text"], wrap=True)
+        self.axes.set_xticks([]); self.axes.set_yticks([])
+        self.canvas.draw_idle()
+
+    def on_generate(self):
+        if self.df is None:
+            return
+        value_column = self.value_col.get()
+        if value_column not in self.df.columns:
+            messagebox.showwarning("Choose a column", "Pick a column to summarize first.")
+            return
+        group_column = self.group_col.get()
+        group_column = None if group_column in (NO_COLUMN, "", value_column) else group_column
+        if group_column and group_column not in self.df.columns:
+            group_column = None
+        chart_type = self.chart_type.get()
+
+        if group_column:
+            self._generate_grouped(group_column, value_column)
+        else:
+            self._generate_single(value_column, chart_type)
+        self.export_table_btn.configure(state="normal" if self.current_rows else "disabled")
+        self.export_chart_btn.configure(state="normal")
+
+    def _generate_single(self, column, chart_type):
+        kind = stats_tools.classify_column(self.df[column], column)
+        if chart_type == "Histogram" or kind == "numeric":
+            edges, counts = stats_tools.numeric_histogram(self.df, column)
+            headers = ["Bin start", "Bin end", "Count"]
+            rows = [(f"{edges[i]:.3g}", f"{edges[i + 1]:.3g}", counts[i]) for i in range(len(counts))]
+            if chart_type == "Table only":
+                self._clear_chart(f"{len(counts):,} bins for '{column}' — see the table below.")
+            else:
+                self._draw_histogram(edges, counts, column)
+        else:
+            order = "key" if kind == "year" else "count"
+            counts = stats_tools.value_counts(self.df, column, order=order)
+            total = sum(count for _value, count in counts) or 1
+            headers = ["Value", "Count", "Percentage"]
+            rows = [(value, count, f"{count / total:.1%}") for value, count in counts]
+            if chart_type == "Pie chart":
+                self._draw_pie(counts, column)
+            elif chart_type == "Table only":
+                self._clear_chart(f"{len(counts):,} distinct values in '{column}' — see the table below.")
+            else:
+                self._draw_bar(counts, column)
+        self.current_headers, self.current_rows = headers, rows
+        self.counts_table.retitle(headers)
+        self.counts_table.set_rows(rows)
+
+    def _generate_grouped(self, group_column, value_column):
+        rows_values, col_values, matrix = stats_tools.cross_tab_counts(self.df, group_column, value_column)
+        headers = [group_column, value_column, "Count"]
+        rows = [(row_value, col_value, matrix[i][j])
+                for i, row_value in enumerate(rows_values)
+                for j, col_value in enumerate(col_values) if matrix[i][j]]
+        rows.sort(key=lambda item: (-item[2], item[0], item[1]))
+        self.current_headers, self.current_rows = headers, rows
+        self.counts_table.retitle(headers)
+        self.counts_table.set_rows(rows)
+        self._draw_grouped_bar(rows_values, col_values, matrix, group_column, value_column)
+
+    def _draw_bar(self, counts, column, max_bars=15):
+        self.axes.clear()
+        colors = _style_chart_axes(self.figure, self.axes)
+        shown = counts[:max_bars]
+        labels = [str(value)[:20] for value, _count in shown]
+        self.axes.bar(labels, [count for _value, count in shown], color=colors["accent"])
+        self.axes.set_title(f"{column}" + (f" (top {max_bars})" if len(counts) > max_bars else ""))
+        self.axes.tick_params(axis="x", rotation=45)
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def _draw_pie(self, counts, column, max_slices=8):
+        self.axes.clear()
+        colors = _style_chart_axes(self.figure, self.axes)
+        shown = counts[:max_slices]
+        other_total = sum(count for _value, count in counts[max_slices:])
+        labels = [str(value)[:20] for value, _count in shown]
+        values = [count for _value, count in shown]
+        if other_total:
+            labels.append("Other"); values.append(other_total)
+        self.axes.pie(values, labels=labels, autopct="%1.0f%%", colors=colors["palette"],
+                      textprops={"color": colors["text"], "fontsize": 8})
+        self.axes.set_title(column)
+        self.canvas.draw_idle()
+
+    def _draw_histogram(self, edges, counts, column):
+        self.axes.clear()
+        colors = _style_chart_axes(self.figure, self.axes)
+        if counts:
+            widths = [edges[i + 1] - edges[i] for i in range(len(counts))]
+            self.axes.bar(edges[:-1], counts, width=widths, align="edge", color=colors["accent"])
+        self.axes.set_title(column)
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def _draw_grouped_bar(self, row_values, col_values, matrix, group_column, value_column,
+                          max_rows=15, max_series=6):
+        self.axes.clear()
+        colors = _style_chart_axes(self.figure, self.axes)
+        shown_rows = row_values[:max_rows]
+        shown_cols = col_values[:max_series]
+        bottoms = [0.0] * len(shown_rows)
+        for series_index, col_value in enumerate(shown_cols):
+            heights = [matrix[row_values.index(row_value)][col_values.index(col_value)]
+                      for row_value in shown_rows]
+            self.axes.bar([str(v)[:16] for v in shown_rows], heights, bottom=bottoms,
+                         label=str(col_value)[:16], color=colors["palette"][series_index % len(colors["palette"])])
+            bottoms = [b + h for b, h in zip(bottoms, heights)]
+        self.axes.set_title(f"{value_column} by {group_column}"
+                            + (" (top values)" if len(row_values) > max_rows or len(col_values) > max_series else ""))
+        self.axes.tick_params(axis="x", rotation=45)
+        self.axes.legend(fontsize=7, facecolor=colors["axes_bg"], labelcolor=colors["text"])
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def on_export_table(self):
+        if self.current_rows:
+            base = os.path.splitext(os.path.basename(self.file_path or "records"))[0]
+            _export_table_rows(self, self.current_rows, self.current_headers, f"{base}_stats.csv")
+
+    def on_export_chart(self):
+        path = filedialog.asksaveasfilename(
+            title="Save chart", defaultextension=".png",
+            filetypes=[("PNG image (.png)", "*.png"), ("PDF document (.pdf)", "*.pdf")])
+        if not path:
+            return
+        try:
+            self.figure.savefig(path, facecolor=self.figure.get_facecolor())
+        except Exception as exc:
+            messagebox.showerror("Export failed", f"Couldn't save the chart:\n{exc}")
+            return
+        messagebox.showinfo("Export complete", f"Saved to:\n{path}")
+
+
+# ---------------------------------------------------------------------------
+# Compare documents: diff two bibliography files (added/removed/changed
+# records). See compare_tools.py for the (unit-tested) matching/diff logic.
+# ---------------------------------------------------------------------------
+
+class CompareDocumentsPage(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(master, fg_color="transparent")
+        self.df_a = self.df_b = None
+        self.path_a = self.path_b = None
+        self.changes = []
+
+        file_row = ctk.CTkFrame(self, fg_color="transparent")
+        file_row.pack(fill="x", padx=4, pady=(6, 4))
+        ctk.CTkButton(file_row, text="Choose file A…", width=130,
+                     command=lambda: self.on_choose_file("a")).pack(side="left")
+        self.label_a = ctk.CTkLabel(file_row, text="File A not chosen", anchor="w")
+        self.label_a.pack(side="left", padx=(8, 24))
+        ctk.CTkButton(file_row, text="Choose file B…", width=130,
+                     command=lambda: self.on_choose_file("b")).pack(side="left")
+        self.label_b = ctk.CTkLabel(file_row, text="File B not chosen", anchor="w")
+        self.label_b.pack(side="left", padx=(8, 0))
+
+        self.title_a, self.doi_a, self.year_a = self._file_mapping_group(self, "File A columns")
+        self.title_b, self.doi_b, self.year_b = self._file_mapping_group(self, "File B columns")
+
+        run_row = ctk.CTkFrame(self, fg_color="transparent")
+        run_row.pack(fill="x", padx=4, pady=(0, 6))
+        self.compare_btn = ctk.CTkButton(run_row, text="Compare", width=110,
+                                         command=self.on_compare, state="disabled")
+        self.compare_btn.pack(side="left")
+        self.export_btn = ctk.CTkButton(run_row, text="Export differences…", width=155,
+                                        command=self.on_export, state="disabled")
+        self.export_btn.pack(side="left", padx=(6, 0))
+
+        self.status_var = ctk.StringVar(
+            value="Records are matched by DOI when both files have one, otherwise by a "
+                  "normalized title. Only records with at least one difference are shown.")
+        ctk.CTkLabel(self, textvariable=self.status_var, anchor="w", justify="left",
+                    wraplength=1100).pack(fill="x", padx=4, pady=(0, 5))
+        self.stats_box = ctk.CTkTextbox(self, height=110, wrap="word", font=ctk.CTkFont(size=14))
+        self.stats_box.pack(fill="x", padx=4, pady=(0, 8))
+        _set_readonly_text(self.stats_box, "Choose both files, confirm the column mappings, then compare.")
+
+        self.table = ResultsTable(
+            self, headers=["Status", "Title", "Field", "Old value", "New value"],
+            weights=[0, 2, 1, 2, 2])
+        self.table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+
+    @staticmethod
+    def _file_mapping_group(parent, heading):
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(frame, text=heading, font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(6, 0))
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x")
+        title = NoteLinkRecoveryPage._mapping(row, "Title column", 0)
+        doi = NoteLinkRecoveryPage._mapping(row, "DOI column", 1)
+        year = NoteLinkRecoveryPage._mapping(row, "Year column (optional)", 2)
+        return title, doi, year
+
+    def on_choose_file(self, which):
+        path = filedialog.askopenfilename(
+            title="Choose a bibliographic file",
+            filetypes=[("Supported files", "*.csv *.xlsx *.xls *.json *.ris *.bib *.bibtex"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            df = core.read_records_file(path).reset_index(drop=True)
+        except Exception as exc:
+            messagebox.showerror("Couldn't read file", f"Failed to read this file:\n{exc}")
+            return
+        columns = list(df.columns)
+        if which == "a":
+            self.df_a, self.path_a = df, path
+            self.label_a.configure(text=f"{os.path.basename(path)} ({len(df):,} records)")
+            menus = (self.title_a, self.doi_a, self.year_a)
+        else:
+            self.df_b, self.path_b = df, path
+            self.label_b.configure(text=f"{os.path.basename(path)} ({len(df):,} records)")
+            menus = (self.title_b, self.doi_b, self.year_b)
+        for menu, aliases in zip(menus, (core.TITLE_ALIASES, core.DOI_ALIASES, core.YEAR_ALIASES)):
+            menu.configure(values=[NO_COLUMN] + columns)
+            menu.set(abstract_tools.guess_column(columns, aliases) or NO_COLUMN)
+        self.compare_btn.configure(state="normal" if self.df_a is not None and self.df_b is not None else "disabled")
+        self.export_btn.configure(state="disabled")
+        self.table.set_rows([])
+
+    def on_compare(self):
+        if self.df_a is None or self.df_b is None:
+            return
+        title_a = None if self.title_a.get() == NO_COLUMN else self.title_a.get()
+        doi_a = None if self.doi_a.get() == NO_COLUMN else self.doi_a.get()
+        year_a = None if self.year_a.get() == NO_COLUMN else self.year_a.get()
+        title_b = None if self.title_b.get() == NO_COLUMN else self.title_b.get()
+        doi_b = None if self.doi_b.get() == NO_COLUMN else self.doi_b.get()
+        year_b = None if self.year_b.get() == NO_COLUMN else self.year_b.get()
+        if not title_a or not title_b:
+            messagebox.showwarning(
+                "Choose a title column", "Pick a Title column for both files — it's used to "
+                                        "identify records and as a fallback match key when a "
+                                        "record has no DOI.")
+            return
+        self.changes, summary = compare_tools.compare_dataframes(
+            self.df_a, self.df_b, doi_column_a=doi_a, title_column_a=title_a, year_column_a=year_a,
+            doi_column_b=doi_b, title_column_b=title_b, year_column_b=year_b)
+        self._show_summary(summary)
+        rows = [(c["status"], c["title"][:100], c["field"], c["old_value"][:200], c["new_value"][:200])
+                for c in self.changes[:2000]]
+        self.table.set_rows(rows)
+        self.export_btn.configure(state="normal" if self.changes else "disabled")
+
+    def _show_summary(self, summary):
+        lines = [
+            f"File A: {summary['records in file A']:,} records · "
+            f"File B: {summary['records in file B']:,} records",
+            f"Matched: {summary['matched records']:,} · "
+            f"Only in A (removed): {summary['records only in file A (removed)']:,} · "
+            f"Only in B (added): {summary['records only in file B (added)']:,} · "
+            f"Changed: {summary['matched records with a changed field']:,}",
+            f"Compared {summary['common columns compared']:,} columns present in both files.",
+        ]
+        if summary["columns only in file A"]:
+            lines.append("Columns only in file A (not compared): " + ", ".join(summary["columns only in file A"]))
+        if summary["columns only in file B"]:
+            lines.append("Columns only in file B (not compared): " + ", ".join(summary["columns only in file B"]))
+        if summary["duplicate keys ignored in file A"] or summary["duplicate keys ignored in file B"]:
+            lines.append(
+                f"Ignored {summary['duplicate keys ignored in file A']:,} duplicate-key record(s) in "
+                f"file A and {summary['duplicate keys ignored in file B']:,} in file B (same DOI/title "
+                f"appeared more than once, so they can't be matched unambiguously).")
+        if len(self.changes) > 2000:
+            lines.append(f"Showing the first 2,000 of {len(self.changes):,} differences — export for the full list.")
+        _set_readonly_text(self.stats_box, "\n".join(lines))
+
+    def on_export(self):
+        if self.changes:
+            _export_table_rows(
+                self, [(c["status"], c["key"], c["title"], c["field"], c["old_value"], c["new_value"])
+                       for c in self.changes],
+                ["Status", "Match key", "Title", "Field", "Old value", "New value"],
+                "comparison_differences.csv")
 
 
 if __name__ == "__main__":
