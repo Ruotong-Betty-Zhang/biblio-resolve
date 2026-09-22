@@ -1504,6 +1504,7 @@ class ManualReviewPage(ctk.CTkFrame):
         self.filter_conditions = []
         self.review_window = None
         self.lookup_status_column = None
+        self.page_size = self.PAGE_SIZE
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=4, pady=(6, 8))
@@ -1556,22 +1557,41 @@ class ManualReviewPage(ctk.CTkFrame):
             .grid(row=1, column=5, padx=5, pady=(0, 7))
         ctk.CTkButton(filters, text="Clear", width=65, command=self.clear_filters) \
             .grid(row=1, column=6, padx=(5, 10), pady=(0, 7))
+        ctk.CTkLabel(filters, text="Combine conditions with").grid(
+            row=0, column=1, columnspan=2, sticky="e", padx=(0, 6), pady=(7, 2))
+        self.filter_mode = ctk.CTkSegmentedButton(filters, values=["AND", "OR"], width=120)
+        self.filter_mode.set("AND")
+        self.filter_mode.grid(row=0, column=3, columnspan=2, sticky="w", padx=5, pady=(7, 2))
         self.filter_summary_box = ctk.CTkTextbox(
             filters, height=52, wrap="word", activate_scrollbars=True,
             font=ctk.CTkFont(size=12), text_color=("gray30", "gray70"))
         self.filter_summary_box.grid(row=2, column=0, columnspan=8, sticky="ew", padx=10, pady=(0, 7))
         _set_readonly_text(
             self.filter_summary_box,
-            "Choose a condition and click Apply. Multiple conditions use AND.")
+            "Choose a condition and click Apply. Use 'Add another' to combine several conditions with AND or OR.")
         filters.grid_columnconfigure(7, weight=1)
         nav = ctk.CTkFrame(main, fg_color="transparent")
         nav.pack(fill="x", pady=(0, 5))
+        self.first_btn = ctk.CTkButton(nav, text="«", width=36, command=lambda: self.go_to_page(0), state="disabled")
+        self.first_btn.pack(side="left")
         self.prev_btn = ctk.CTkButton(nav, text="Previous", width=85, command=lambda: self.change_page(-1), state="disabled")
-        self.prev_btn.pack(side="left")
+        self.prev_btn.pack(side="left", padx=(6, 0))
         self.next_btn = ctk.CTkButton(nav, text="Next", width=70, command=lambda: self.change_page(1), state="disabled")
         self.next_btn.pack(side="left", padx=6)
+        self.last_btn = ctk.CTkButton(nav, text="»", width=36, command=lambda: self.go_to_page(10 ** 9), state="disabled")
+        self.last_btn.pack(side="left")
         self.page_label = ctk.CTkLabel(nav, text="Choose a file to begin")
         self.page_label.pack(side="left", padx=8)
+        ctk.CTkLabel(nav, text="Go to page").pack(side="left", padx=(10, 4))
+        self.page_entry = ctk.CTkEntry(nav, width=55)
+        self.page_entry.pack(side="left")
+        self.page_entry.bind("<Return>", lambda _e: self.jump_to_entered_page())
+        ctk.CTkLabel(nav, text="Rows per page").pack(side="left", padx=(12, 4))
+        self.page_size_menu = ctk.CTkOptionMenu(
+            nav, values=["50", "100", "250", "500", "1000"], width=80,
+            command=self.on_page_size_change)
+        self.page_size_menu.set(str(self.page_size))
+        self.page_size_menu.pack(side="left")
         self.review_btn = ctk.CTkButton(
             nav, text="Open review queue…", width=145,
             command=self.open_review_window, state="disabled")
@@ -1637,6 +1657,7 @@ class ManualReviewPage(ctk.CTkFrame):
         self.df, self.file_path, self.page, self.selected_df_index = df, path, 0, None
         self.filtered_indices = list(df.index)
         self.filter_conditions = []
+        self.filter_mode.set("AND")
         encoding = df.attrs.get("source_encoding")
         encoding_note = f" · {encoding}" if encoding else ""
         self.file_label.configure(text=f"{os.path.basename(path)} ({len(df)} records){encoding_note}")
@@ -1649,7 +1670,7 @@ class ManualReviewPage(ctk.CTkFrame):
         self._on_filter_column_change(str(df.columns[0]))
         _set_readonly_text(
             self.filter_summary_box,
-            "Choose a condition and click Apply. Multiple conditions use AND.")
+            "Choose a condition and click Apply. Use 'Add another' to combine several conditions with AND or OR.")
         _set_readonly_text_autosize(self.message_view, "Select a record to see its full verification message.")
         self.render_page()
 
@@ -1702,14 +1723,14 @@ class ManualReviewPage(ctk.CTkFrame):
 
     def _update_filter_summary(self, applied=True):
         if not self.filter_conditions:
-            _set_readonly_text(self.filter_summary_box, "No filters applied. Multiple conditions use AND.")
+            _set_readonly_text(self.filter_summary_box, "No filters applied.")
             return
         parts = []
         for column, operator, value, upper in self.filter_conditions:
             expression = f"{column} {operator} {value}".strip()
             parts.append(expression + (f" and {upper}" if operator == "between" else ""))
         prefix = f"Showing {len(self.filtered_indices):,}/{len(self.df):,} records | " if applied else "Pending | "
-        _set_readonly_text(self.filter_summary_box, prefix + " AND ".join(parts))
+        _set_readonly_text(self.filter_summary_box, prefix + f" {self.filter_mode.get()} ".join(parts))
 
     def apply_filters(self):
         if self.df is None:
@@ -1722,7 +1743,8 @@ class ManualReviewPage(ctk.CTkFrame):
         if condition not in self.filter_conditions:
             self.filter_conditions.append(condition)
         self._store_selected()
-        mask = pd.Series(True, index=self.df.index)
+        use_or = self.filter_mode.get() == "OR"
+        mask = pd.Series(not use_or, index=self.df.index)
         try:
             for column, operator, value, upper in self.filter_conditions:
                 series = self.df[column]
@@ -1730,9 +1752,9 @@ class ManualReviewPage(ctk.CTkFrame):
                     numeric, target = pd.to_numeric(series, errors="coerce"), float(value)
                     operations = {">": numeric > target, ">=": numeric >= target, "<": numeric < target,
                                   "<=": numeric <= target, "=": numeric == target, "!=": numeric != target}
-                    condition = numeric.between(target, float(upper), inclusive="both") \
+                    result = numeric.between(target, float(upper), inclusive="both") \
                         if operator == "between" else operations[operator]
-                    condition &= numeric.notna()
+                    result &= numeric.notna()
                 else:
                     text = series.fillna("").astype(str).str.strip()
                     folded, target = text.str.casefold(), value.casefold()
@@ -1740,8 +1762,9 @@ class ManualReviewPage(ctk.CTkFrame):
                                   "contains": folded.str.contains(re.escape(target), na=False),
                                   "does not contain": ~folded.str.contains(re.escape(target), na=False),
                                   "is blank": text.eq(""), "is not blank": text.ne("")}
-                    condition = operations[operator]
-                mask &= condition.fillna(False)
+                    result = operations[operator]
+                result = result.fillna(False)
+                mask = (mask | result) if use_or else (mask & result)
         except (ValueError, KeyError) as exc:
             messagebox.showerror("Invalid filter", f"The filter could not be applied:\n{exc}")
             return
@@ -1761,19 +1784,20 @@ class ManualReviewPage(ctk.CTkFrame):
         self.apply_btn.configure(state="disabled")
         _set_readonly_text(
             self.filter_summary_box,
-            "Choose a condition and click Apply. Multiple conditions use AND.")
+            "Choose a condition and click Apply. Use 'Add another' to combine several conditions with AND or OR.")
         self.render_page()
 
-    def _build_column_choices(self):
+    def _build_column_choices(self, selected=None):
         for child in self.column_box.winfo_children():
             child.destroy()
         self.column_vars = {}
-        defaults = set()
+        defaults = set(selected) if selected is not None else set()
         columns = list(self.df.columns)
-        for _, aliases in self.DEFAULT_ALIASES:
-            guessed = core.guess_column(columns, aliases)
-            if guessed:
-                defaults.add(guessed)
+        if selected is None:
+            for _, aliases in self.DEFAULT_ALIASES:
+                guessed = core.guess_column(columns, aliases)
+                if guessed:
+                    defaults.add(guessed)
         for column in columns:
             var = ctk.BooleanVar(value=column in defaults)
             self.column_vars[column] = var
@@ -1806,8 +1830,11 @@ class ManualReviewPage(ctk.CTkFrame):
         if self.table is not None:
             self.table.destroy()
         active_indices = self.filtered_indices if self.filtered_indices or self.filter_conditions else list(self.df.index)
-        start = self.page * self.PAGE_SIZE
-        end = min(len(active_indices), start + self.PAGE_SIZE)
+        total = len(active_indices)
+        last_page = max(0, (total - 1) // self.page_size)
+        self.page = min(max(self.page, 0), last_page)
+        start = self.page * self.page_size
+        end = min(total, start + self.page_size)
         self.page_indices = active_indices[start:end]
         link_columns, resolvers = set(), {}
         for i, column in enumerate(columns):
@@ -1825,13 +1852,16 @@ class ManualReviewPage(ctk.CTkFrame):
                      for idx in self.page_indices]
         rows = [[value[:180] for value in row] for row in copy_rows]
         self.table.set_rows(rows, copy_values=copy_rows)
-        total = len(active_indices)
-        pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        pages = last_page + 1
         first = start + 1 if total else 0
-        self.page_label.configure(text=f"Rows {start + 1}–{end} of {len(self.df)} · Page {self.page + 1}/{pages}")
         self.page_label.configure(text=f"Rows {first}-{end} of {total} | Page {self.page + 1}/{pages}")
-        self.prev_btn.configure(state="normal" if self.page > 0 else "disabled")
-        self.next_btn.configure(state="normal" if end < total else "disabled")
+        has_prev, has_next = self.page > 0, end < total
+        self.first_btn.configure(state="normal" if has_prev else "disabled")
+        self.prev_btn.configure(state="normal" if has_prev else "disabled")
+        self.next_btn.configure(state="normal" if has_next else "disabled")
+        self.last_btn.configure(state="normal" if has_next else "disabled")
+        self.page_entry.delete(0, "end")
+        self.page_entry.insert(0, str(self.page + 1))
 
     def select_row(self, local_index):
         if local_index >= len(self.page_indices):
@@ -1912,18 +1942,42 @@ class ManualReviewPage(ctk.CTkFrame):
             return
         if name not in self.df.columns:
             self.df[name] = ""
-        self._build_column_choices()
-        self.column_vars[name].set(True)
+        self.register_columns_changed(select=name)
         self.render_page()
         if self.selected_df_index is not None:
             self._render_custom_editor()
 
+    def register_columns_changed(self, select=None):
+        """Refresh the column chooser and filter list after columns were added,
+        keeping the reviewer's current display selection."""
+        chosen = set(self.selected_columns())
+        if select:
+            chosen.add(select)
+        self._build_column_choices(selected=chosen)
+        _update_combobox_values(self.filter_column, list(self.df.columns))
+
     def change_page(self, delta):
+        self.go_to_page(self.page + delta)
+
+    def go_to_page(self, page):
+        if self.df is None:
+            return
         self._store_selected()
-        self.page += delta
+        self.page = max(0, page)  # render_page clamps to the last page
         self.selected_df_index = None
         self.apply_btn.configure(state="disabled")
         self.render_page()
+
+    def jump_to_entered_page(self):
+        try:
+            page = int(self.page_entry.get().strip())
+        except ValueError:
+            return
+        self.go_to_page(page - 1)
+
+    def on_page_size_change(self, value):
+        self.page_size = int(value)
+        self.go_to_page(0)
 
     def open_review_window(self):
         if self.df is None:
@@ -2009,11 +2063,22 @@ class ManualReviewDialog(ctk.CTkToplevel):
         self.minsize(940, 650)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.topmost_var = ctk.BooleanVar(value=False)
+        self.show_compare_var = ctk.BooleanVar(value=True)
+        self.field_entries = {}   # field label -> (widget getter, column name or None, canonical new-column name)
+        self.other_editors = {}   # column name -> getter for the "All fields" view
 
         header = ctk.CTkFrame(self)
         header.pack(fill="x", padx=10, pady=(10, 6))
         self.record_label = ctk.CTkLabel(header, text="", font=ctk.CTkFont(size=16, weight="bold"))
         self.record_label.pack(side="left", padx=10, pady=8)
+        self.compare_switch = ctk.CTkSwitch(
+            header, text="Show comparison", variable=self.show_compare_var,
+            command=self._on_view_change)
+        self.compare_switch.pack(side="left", padx=(16, 8))
+        self.view_toggle = ctk.CTkSegmentedButton(
+            header, values=["Key fields", "All fields"], command=lambda _v: self._on_view_change())
+        self.view_toggle.set("Key fields")
+        self.view_toggle.pack(side="left", padx=8)
         self.topmost_switch = ctk.CTkSwitch(
             header, text="Keep on top", variable=self.topmost_var,
             command=self._toggle_topmost)
@@ -2032,16 +2097,22 @@ class ManualReviewDialog(ctk.CTkToplevel):
         headings.pack(fill="x", padx=16)
         headings.grid_columnconfigure(1, weight=1)
         headings.grid_columnconfigure(3, weight=1)
+        self.headings = headings
         ctk.CTkLabel(headings, text="Field", width=145, anchor="w",
                      font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(headings, text="Input record", anchor="w",
-                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=1, sticky="w", padx=5)
-        ctk.CTkLabel(headings, text="Retrieved verification metadata", anchor="w",
-                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=3, sticky="w", padx=5)
+        self.input_heading = ctk.CTkLabel(
+            headings, text="Input record (editable)", anchor="w", font=ctk.CTkFont(weight="bold"))
+        self.input_heading.grid(row=0, column=1, sticky="w", padx=5)
+        self.retrieved_heading = ctk.CTkLabel(
+            headings, text="Retrieved verification metadata", anchor="w",
+            font=ctk.CTkFont(weight="bold"))
+        self.retrieved_heading.grid(row=0, column=3, sticky="w", padx=5)
 
         self.comparison_frame = ctk.CTkScrollableFrame(self, height=300)
         self.comparison_frame.grid_columnconfigure(1, weight=1)
         self.comparison_frame.grid_columnconfigure(3, weight=1)
+        self.all_fields_frame = ctk.CTkScrollableFrame(self, height=300)
+        self.all_fields_frame.grid_columnconfigure(1, weight=1)
 
         message_frame = ctk.CTkFrame(self)
         ctk.CTkLabel(message_frame, text="Verification message",
@@ -2078,10 +2149,12 @@ class ManualReviewDialog(ctk.CTkToplevel):
         self.comparison_frame.pack(side="top", fill="both", expand=True,
                                    padx=10, pady=(3, 6))
 
+        self._apply_view_layout()
         self.set_queue(queue_indices, start_index)
         self.after(80, self.lift)
 
     def set_queue(self, queue_indices, start_index=None):
+        self._commit_fields()
         self.queue_indices = list(queue_indices)
         if start_index in self.queue_indices:
             self.position = self.queue_indices.index(start_index)
@@ -2161,29 +2234,148 @@ class ManualReviewDialog(ctk.CTkToplevel):
             return value
         return "https://" + value
 
-    def _add_comparison_row(self, row_number, field, input_value, retrieved_value):
-        category, explanation = self._compare(field, input_value, retrieved_value)
+    def _on_view_change(self):
+        # Keep typed edits when switching layouts, then redraw the record.
+        self._commit_fields()
+        self._apply_view_layout()
+        self._load_record()
+
+    def _apply_view_layout(self):
+        show_compare = bool(self.show_compare_var.get())
+        all_fields = self.view_toggle.get() == "All fields"
+        if show_compare and not all_fields:
+            self.retrieved_heading.grid()
+        else:
+            self.retrieved_heading.grid_remove()
+        self.comparison_frame.grid_columnconfigure(3, weight=1 if show_compare else 0)
+        self.comparison_frame.grid_columnconfigure(2, minsize=105 if show_compare else 0)
+        if all_fields:
+            self.input_heading.configure(text="Value (editable)")
+            self.comparison_frame.pack_forget()
+            self.all_fields_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(3, 6))
+        else:
+            self.input_heading.configure(text="Input record (editable)")
+            self.all_fields_frame.pack_forget()
+            self.comparison_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(3, 6))
+
+    def _make_editor(self, parent, value, width=None, grid=None):
+        """A single-line entry, or a small textbox for long/multi-line values.
+        Returns (widget, getter)."""
+        if len(value) > 150 or "\n" in value:
+            widget = ctk.CTkTextbox(parent, height=80, wrap="word", font=ctk.CTkFont(size=13))
+            widget.insert("1.0", value)
+            getter = lambda w=widget: w.get("1.0", "end-1c").strip()
+        else:
+            widget = ctk.CTkEntry(parent) if width is None else ctk.CTkEntry(parent, width=width)
+            widget.insert(0, value)
+            getter = lambda w=widget: w.get().strip()
+        return widget, getter
+
+    def _add_comparison_row(self, row_number, field, input_value, retrieved_value,
+                            column=None, new_column_name=None):
+        show_compare = bool(self.show_compare_var.get())
+        if show_compare:
+            category, explanation = self._compare(field, input_value, retrieved_value)
+        else:
+            category, explanation = "missing", ""
         color = self._row_color(category)
         ctk.CTkLabel(self.comparison_frame, text=field, width=140, anchor="w",
                      font=ctk.CTkFont(weight="bold")).grid(row=row_number, column=0, sticky="nw", padx=6, pady=4)
-        for column, value in ((1, input_value), (3, retrieved_value)):
-            holder = ctk.CTkFrame(self.comparison_frame, fg_color=color)
-            holder.grid(row=row_number, column=column, sticky="nsew", padx=4, pady=3)
-            holder.grid_columnconfigure(0, weight=1)
-            value_label = ctk.CTkLabel(holder, text=value or "(not available)", anchor="w", justify="left",
-                                       wraplength=390)
-            value_label.grid(row=0, column=0, sticky="ew", padx=7, pady=6)
-            direct_url = self._clickable_url(field, value) if field in {"DOI", "URL"} else ""
-            if direct_url:
-                value_label.configure(text_color=("#1261a0", "#69b7ff"), cursor="hand2")
-                value_label.bind("<Button-1>", lambda _event, url=direct_url: webbrowser.open(url))
-            ctk.CTkButton(holder, text="Copy", width=48, height=24,
-                          command=lambda item=value: self._copy_value(item)).grid(
-                              row=0, column=1, padx=(2, 5), pady=4)
+
+        holder = ctk.CTkFrame(self.comparison_frame, fg_color=color if show_compare else "transparent")
+        holder.grid(row=row_number, column=1, sticky="nsew", padx=4, pady=3)
+        holder.grid_columnconfigure(0, weight=1)
+        editor, getter = self._make_editor(holder, input_value)
+        editor.grid(row=0, column=0, sticky="ew", padx=(7, 2), pady=6)
+        self.field_entries[field] = (getter, column, new_column_name)
+        direct = (lambda: self._clickable_url(field, getter())) if field in {"DOI", "URL"} else None
+        if direct:
+            ctk.CTkButton(holder, text="Open", width=48, height=24,
+                          command=lambda: direct() and webbrowser.open(direct())).grid(
+                              row=0, column=1, padx=(2, 2), pady=4)
+        ctk.CTkButton(holder, text="Copy", width=48, height=24,
+                      command=lambda: self._copy_value(getter())).grid(
+                          row=0, column=2, padx=(2, 5), pady=4)
+
+        if not show_compare:
+            return
+        ret_holder = ctk.CTkFrame(self.comparison_frame, fg_color=color)
+        ret_holder.grid(row=row_number, column=3, sticky="nsew", padx=4, pady=3)
+        ret_holder.grid_columnconfigure(0, weight=1)
+        value_label = ctk.CTkLabel(ret_holder, text=retrieved_value or "(not available)", anchor="w",
+                                   justify="left", wraplength=390)
+        value_label.grid(row=0, column=0, sticky="ew", padx=7, pady=6)
+        direct_url = self._clickable_url(field, retrieved_value) if field in {"DOI", "URL"} else ""
+        if direct_url:
+            value_label.configure(text_color=("#1261a0", "#69b7ff"), cursor="hand2")
+            value_label.bind("<Button-1>", lambda _event, url=direct_url: webbrowser.open(url))
+        ctk.CTkButton(ret_holder, text="Copy", width=48, height=24,
+                      command=lambda item=retrieved_value: self._copy_value(item)).grid(
+                          row=0, column=1, padx=(2, 5), pady=4)
         symbol = {"match": "✓", "warning": "!", "different": "×", "missing": "—"}[category]
         ctk.CTkLabel(self.comparison_frame, text=f"{symbol}\n{explanation}", width=105,
                      justify="center", text_color=("gray20", "gray80")).grid(
                          row=row_number, column=2, sticky="nsew", padx=3, pady=4)
+
+    # Key fields: label, input aliases, name used when the column must be created.
+    EDITABLE_FIELDS = [
+        ("Title", core.TITLE_ALIASES, "Title"),
+        ("Authors", core.AUTHOR_ALIASES, "Author"),
+        ("Publication year", core.YEAR_ALIASES, "Publication Year"),
+        ("Item type", core.ITEM_TYPE_ALIASES, "Item Type"),
+        ("Publisher", core.PUBLISHER_ALIASES, "Publisher"),
+        ("Publication / container", core.JOURNAL_ALIASES, "Publication Title"),
+        ("DOI", core.DOI_ALIASES, "DOI"),
+        ("URL", core.URL_ALIASES, "Url"),
+    ]
+
+    def _commit_fields(self):
+        """Write edited field values back into the DataFrame. Returns True if anything changed."""
+        if not self.queue_indices or not (self.field_entries or self.other_editors):
+            return False
+        page, index = self.review_page, self._current_index()
+        changed, new_columns = False, False
+        edits = [(column or new_name, getter, column is None)
+                 for getter, column, new_name in self.field_entries.values()]
+        edits += [(column, getter, False) for column, getter in self.other_editors.items()]
+        for column, getter, is_new in edits:
+            text = getter()
+            if column not in page.df.columns:
+                if not text:
+                    continue
+                page.df[column] = ""
+                new_columns = True
+            current = page._display_value(page.df.at[index, column]).strip()
+            if text == current:
+                continue
+            if page.df[column].dtype != object:
+                page.df[column] = page.df[column].astype(object)
+            page.df.at[index, column] = text
+            changed = True
+        if new_columns:
+            page.register_columns_changed()
+        if changed:
+            page.render_page()
+        return changed
+
+    def _build_all_fields(self, row):
+        for child in self.all_fields_frame.winfo_children():
+            child.destroy()
+        self.other_editors = {}
+        mapped = {column for _getter, column, _n in self.field_entries.values() if column}
+        skip = mapped | {"Manual Decision", "Manual Notes"}
+        number = 0
+        for column in row.index:
+            if column in skip:
+                continue
+            ctk.CTkLabel(self.all_fields_frame, text=str(column), width=200, anchor="nw",
+                         wraplength=190, justify="left").grid(
+                             row=number, column=0, sticky="nw", padx=6, pady=4)
+            value = self.review_page._display_value(row.get(column, "")).strip()
+            editor, getter = self._make_editor(self.all_fields_frame, value)
+            editor.grid(row=number, column=1, sticky="ew", padx=4, pady=3)
+            self.other_editors[column] = getter
+            number += 1
 
     def _load_record(self):
         if not self.queue_indices:
@@ -2191,30 +2383,28 @@ class ManualReviewDialog(ctk.CTkToplevel):
         row = self.review_page.df.loc[self._current_index()]
         for child in self.comparison_frame.winfo_children():
             child.destroy()
-        input_doi = self._column_value(row, core.DOI_ALIASES)
-        input_url = self._column_value(row, core.URL_ALIASES)
+        self.field_entries = {}
         resolved_url = self._column_value(row, [], ("Resolved URL",))
         retrieved_doi = self._column_value(row, [], ("Verification Metadata DOI",))
         if not retrieved_doi and resolved_url and "doi.org/" in resolved_url.casefold():
             retrieved_doi = core.normalize_doi(resolved_url)
-        fields = [
-            ("Title", self._column_value(row, core.TITLE_ALIASES),
-             self._column_value(row, [], ("Verification Metadata Combined Title", "Verification Metadata Title"))),
-            ("Authors", self._column_value(row, core.AUTHOR_ALIASES),
-             self._column_value(row, [], ("Verification Metadata Authors",))),
-            ("Publication year", self._column_value(row, core.YEAR_ALIASES),
-             self._column_value(row, [], ("Verification Metadata Year",))),
-            ("Item type", self._column_value(row, core.ITEM_TYPE_ALIASES),
-             self._column_value(row, [], ("Verification Metadata Item Type",))),
-            ("Publisher", self._column_value(row, core.PUBLISHER_ALIASES),
-             self._column_value(row, [], ("Verification Metadata Publisher",))),
-            ("Publication / container", self._column_value(row, core.JOURNAL_ALIASES),
-             self._column_value(row, [], ("Verification Metadata Container Title",))),
-            ("DOI", input_doi, retrieved_doi),
-            ("URL", input_url, resolved_url),
-        ]
-        for number, values in enumerate(fields):
-            self._add_comparison_row(number, *values)
+        retrieved = {
+            "Title": self._column_value(
+                row, [], ("Verification Metadata Combined Title", "Verification Metadata Title")),
+            "Authors": self._column_value(row, [], ("Verification Metadata Authors",)),
+            "Publication year": self._column_value(row, [], ("Verification Metadata Year",)),
+            "Item type": self._column_value(row, [], ("Verification Metadata Item Type",)),
+            "Publisher": self._column_value(row, [], ("Verification Metadata Publisher",)),
+            "Publication / container": self._column_value(
+                row, [], ("Verification Metadata Container Title",)),
+            "DOI": retrieved_doi,
+            "URL": resolved_url,
+        }
+        for number, (field, aliases, new_name) in enumerate(self.EDITABLE_FIELDS):
+            column = core.guess_column(row.index, aliases)
+            value = self.review_page._display_value(row.get(column, "")).strip() if column else ""
+            self._add_comparison_row(number, field, value, retrieved[field], column, new_name)
+        self._build_all_fields(row)
 
         status = self._column_value(row, [], ("Verification Status",)) or "(no verification status)"
         lookup_status = (self.review_page._display_value(
@@ -2246,6 +2436,7 @@ class ManualReviewDialog(ctk.CTkToplevel):
         self.next_btn.configure(state="normal" if self.position + 1 < len(self.queue_indices) else "disabled")
 
     def _save(self):
+        self._commit_fields()
         index = self._current_index()
         state = self.review_state.get()
         if self.review_page.lookup_status_column and state in self.REVIEW_STATES:
@@ -2269,6 +2460,7 @@ class ManualReviewDialog(ctk.CTkToplevel):
             self._load_record()
 
     def _move(self, delta):
+        self._commit_fields()
         new_position = self.position + delta
         if 0 <= new_position < len(self.queue_indices):
             self.position = new_position
@@ -2280,6 +2472,7 @@ class ManualReviewDialog(ctk.CTkToplevel):
             text="Always on top: ON" if self.topmost_var.get() else "Keep on top")
 
     def _close(self):
+        self._commit_fields()
         self.review_page.review_window = None
         self.destroy()
 

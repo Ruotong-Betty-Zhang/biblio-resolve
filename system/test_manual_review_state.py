@@ -30,6 +30,7 @@ class ManualReviewStateTests(unittest.TestCase):
             review_page=page, REVIEW_STATES=ManualReviewDialog.REVIEW_STATES,
             _current_index=lambda: 0, review_state=SimpleNamespace(get=lambda: choice),
             notes=SimpleNamespace(get=lambda: note), _load_record=mock.Mock(),
+            _commit_fields=mock.Mock(),
         )
         return dialog, page
 
