@@ -51,12 +51,14 @@ try:  # Package import: import system.literature_lookup
     from . import issp_module_tags as issp_tags
     from . import lookup_core as core
     from . import stats_tools
+    from . import translate_tools
 except ImportError:  # Direct launch: python literature_lookup.py from system/
     import abstract_note_tools as abstract_tools
     import compare_tools
     import issp_module_tags as issp_tags
     import lookup_core as core
     import stats_tools
+    import translate_tools
 
 
 def _resource_path(filename):
@@ -610,6 +612,7 @@ class App(ctk.CTk):
         review_tab = tabview.add("Manual Review")
         statistics_tab = tabview.add("Statistics")
         compare_tab = tabview.add("Compare Documents")
+        translate_tab = tabview.add("Translate")
         sources_tab = tabview.add("Sources")
         tabview.set("Single Lookup")
 
@@ -649,6 +652,9 @@ class App(ctk.CTk):
 
         self.compare_page = CompareDocumentsPage(compare_tab)
         self.compare_page.pack(fill="both", expand=True)
+
+        self.translate_page = TranslatePage(translate_tab)
+        self.translate_page.pack(fill="both", expand=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4125,6 +4131,325 @@ class CompareDocumentsPage(ctk.CTkFrame):
                        for c in self.changes],
                 ["Status", "Match key", "Title", "Field", "Old value", "New value"],
                 "comparison_differences.csv")
+
+
+# ---------------------------------------------------------------------------
+# Translate: machine-translate a text column with Azure Translator or DeepL
+# ---------------------------------------------------------------------------
+
+class TranslateSettingsDialog(ctk.CTkToplevel):
+    """API keys for the translation providers, saved into the same shared
+    settings file as Sources' email/API keys (see core.save_settings)."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Translation API keys")
+        self.geometry("620x520")
+        self.minsize(560, 460)
+        self.transient(master.winfo_toplevel())
+
+        ctk.CTkLabel(
+            self, text="Translation API keys", font=ctk.CTkFont(size=20, weight="bold"),
+            anchor="w").pack(fill="x", padx=18, pady=(18, 6))
+        ctk.CTkLabel(
+            self, text="Saved automatically as you type, and restored next time you open the app. "
+                       "You only need a key for whichever provider you pick on the Translate page.",
+            justify="left", anchor="w", wraplength=560,
+            text_color=("gray25", "gray75")).pack(fill="x", padx=18, pady=(0, 12))
+
+        self.azure_key_entry = self._labeled_entry(
+            "Azure Translator API key", "optional",
+            "Free F0 tier: 2,000,000 characters/month. Create a \"Translator\" resource at "
+            "portal.azure.com to get a key and region.")
+        self.azure_region_entry = self._labeled_entry(
+            "Azure Translator region", "e.g. eastus",
+            "The \"Location/Region\" shown next to the key on the Azure resource's Keys and "
+            "Endpoint page - required, translation requests fail without it.")
+        self.deepl_key_entry = self._labeled_entry(
+            "DeepL API key", "optional",
+            "Free tier: 500,000 characters/month, generally the higher translation quality. "
+            "Sign up at deepl.com/pro-api - a free-tier key ends in \":fx\".")
+        self.mymemory_email_entry = self._labeled_entry(
+            "MyMemory contact email", "optional, no account needed",
+            "No signup and no key at all - MyMemory works with nothing filled in here, at "
+            "5,000 characters/day. Adding an email here raises that to 50,000/day (that pool "
+            "is shared by everyone using the same email, so your own address only helps if "
+            "you're the only one using it). Translation quality is behind Azure/DeepL, but "
+            "it's the only option here with no account and no card needed.")
+
+        self._load_saved_settings()
+        for entry, key in ((self.azure_key_entry, "translate_azure_key"),
+                           (self.azure_region_entry, "translate_azure_region"),
+                           (self.deepl_key_entry, "translate_deepl_key"),
+                           (self.mymemory_email_entry, "translate_mymemory_email")):
+            entry.bind("<FocusOut>", lambda e: self._save())
+            entry.bind("<Return>", lambda e: self._save())
+
+        ctk.CTkButton(self, text="Close", width=100, command=self.destroy).pack(
+            anchor="e", padx=18, pady=(6, 16))
+
+    def _labeled_entry(self, label, placeholder, note):
+        ctk.CTkLabel(self, text=label, anchor="w").pack(fill="x", padx=18, pady=(6, 0))
+        entry = ctk.CTkEntry(self, placeholder_text=placeholder)
+        entry.pack(fill="x", padx=18, pady=(2, 0))
+        ctk.CTkLabel(self, text=note, text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11),
+                    anchor="w", justify="left", wraplength=560).pack(fill="x", padx=18, pady=(0, 4))
+        return entry
+
+    def _load_saved_settings(self):
+        saved = core.load_settings()
+        for entry, key in ((self.azure_key_entry, "translate_azure_key"),
+                           (self.azure_region_entry, "translate_azure_region"),
+                           (self.deepl_key_entry, "translate_deepl_key"),
+                           (self.mymemory_email_entry, "translate_mymemory_email")):
+            value = saved.get(key)
+            if value:
+                entry.delete(0, "end")
+                entry.insert(0, value)
+
+    def _save(self):
+        core.save_settings({
+            "translate_azure_key": self.azure_key_entry.get().strip(),
+            "translate_azure_region": self.azure_region_entry.get().strip(),
+            "translate_deepl_key": self.deepl_key_entry.get().strip(),
+            "translate_mymemory_email": self.mymemory_email_entry.get().strip(),
+        })
+
+
+class TranslatePage(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(master, fg_color="transparent")
+        self.df = self.output_df = None
+        self.file_path = None
+        self.running = False
+        self.cancel_event = threading.Event()
+        self.events = queue.Queue()
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=4, pady=(6, 8))
+        ctk.CTkButton(top, text="Choose file…", width=130, command=self.on_choose_file).pack(side="left")
+        self.file_label = ctk.CTkLabel(top, text="Choose a Zotero-compatible bibliographic file", anchor="w")
+        self.file_label.pack(side="left", padx=12, fill="x", expand=True)
+        ctk.CTkButton(top, text="⚙ Settings…", width=110, command=self.on_open_settings).pack(side="right")
+        ctk.CTkButton(top, text="🗑 Clear cache…", width=130, command=self.on_clear_cache).pack(
+            side="right", padx=(0, 6))
+        self.export_btn = ctk.CTkButton(top, text="Export translated copy…", width=190,
+                                        command=self.on_export, state="disabled")
+        self.export_btn.pack(side="right", padx=(0, 6))
+
+        mapping = ctk.CTkFrame(self)
+        mapping.pack(fill="x", padx=4, pady=(0, 4))
+        self.title_col = NoteLinkRecoveryPage._mapping(mapping, "Title column", 0)
+        self.abstract_col = NoteLinkRecoveryPage._mapping(mapping, "Abstract column", 1)
+
+        settings_row = ctk.CTkFrame(self)
+        settings_row.pack(fill="x", padx=4, pady=(0, 6))
+        ctk.CTkLabel(settings_row, text="Provider", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.provider_menu = ctk.CTkOptionMenu(
+            settings_row, values=[translate_tools.PROVIDER_LABELS[p] for p in translate_tools.PROVIDERS],
+            width=180, command=self._on_provider_change)
+        self.provider_menu.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+
+        ctk.CTkLabel(settings_row, text="Translate to", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=1, sticky="w", padx=10, pady=(8, 2))
+        self.language_menu = ctk.CTkOptionMenu(settings_row, values=["English"], width=180)
+        self.language_menu.grid(row=1, column=1, sticky="w", padx=10, pady=(0, 10))
+        self._on_provider_change(self.provider_menu.get())
+
+        self.overwrite_var = ctk.BooleanVar(
+            value=bool(core.load_settings().get("translate_overwrite_existing", False)))
+        ctk.CTkCheckBox(
+            settings_row, variable=self.overwrite_var, command=self._save_overwrite_setting,
+            text="Re-translate rows that already have a bracketed translation\n"
+                 "(unchecked = skip them and save quota)").grid(
+                     row=1, column=2, sticky="w", padx=10, pady=(0, 10))
+
+        run_row = ctk.CTkFrame(self, fg_color="transparent")
+        run_row.pack(fill="x", padx=4, pady=(0, 6))
+        self.run_btn = ctk.CTkButton(run_row, text="Translate", width=110,
+                                     command=self.on_run, state="disabled")
+        self.run_btn.pack(side="left")
+        self.stop_btn = ctk.CTkButton(run_row, text="Stop", width=75, command=self.on_stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(6, 0))
+
+        self.progress = ctk.CTkProgressBar(self)
+        self.progress.pack(fill="x", padx=4, pady=(0, 5)); self.progress.set(0)
+        self.status_var = ctk.StringVar(
+            value="Pick a Title and/or Abstract column (at least one). Each is translated in "
+                  "place as \"original [translated]\" — the original text is always kept, nothing "
+                  "is overwritten with translation-only text. The source language is auto-detected, "
+                  "and a field already in the target language is skipped entirely — not even sent "
+                  "to the API — so it costs no quota and is left as the bare original with no "
+                  "brackets added. Add your API key(s) under Settings before translating.")
+        ctk.CTkLabel(self, textvariable=self.status_var, anchor="w", justify="left",
+                     wraplength=1100).pack(fill="x", padx=4, pady=(0, 5))
+        self.stats_box = ctk.CTkTextbox(self, height=110, wrap="word", font=ctk.CTkFont(size=14))
+        self.stats_box.pack(fill="x", padx=4, pady=(0, 8))
+        _set_readonly_text(
+            self.stats_box, "Run a translation to see a summary here: how many records were "
+                            "already in the target language, how many were translated (and from "
+                            "which source languages), and how many came from the local cache.")
+        self.table = ResultsTable(
+            self, headers=["Title", "Abstract"], weights=[1, 2])
+        self.table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+        self.after(150, self._poll_events)
+
+    def _on_provider_change(self, _label=None):
+        provider = self._current_provider()
+        labels = translate_tools.provider_language_labels(provider)
+        current = self.language_menu.get()
+        self.language_menu.configure(values=labels)
+        self.language_menu.set(current if current in labels else ("English" if "English" in labels else labels[0]))
+
+    def _current_provider(self):
+        label = self.provider_menu.get()
+        for provider, provider_label in translate_tools.PROVIDER_LABELS.items():
+            if provider_label == label:
+                return provider
+        return translate_tools.PROVIDERS[0]
+
+    def _save_overwrite_setting(self):
+        core.save_settings({"translate_overwrite_existing": bool(self.overwrite_var.get())})
+
+    def on_open_settings(self):
+        TranslateSettingsDialog(self)
+
+    def on_clear_cache(self):
+        count = translate_tools.translate_cache_entry_count()
+        if count == 0:
+            messagebox.showinfo("Translation cache", "The cache is already empty.")
+            return
+        if not messagebox.askyesno(
+                "Clear translation cache",
+                f"Delete {count:,} cached translation(s)? This can't be undone — anything that "
+                f"was cached will need a fresh API call (and quota) the next time it comes up."):
+            return
+        translate_tools.clear_translate_cache()
+        messagebox.showinfo("Translation cache", f"Cleared {count:,} cached translation(s).")
+
+    def on_choose_file(self):
+        path = filedialog.askopenfilename(
+            title="Choose a bibliographic file",
+            filetypes=[("Supported files", "*.csv *.xlsx *.xls *.json *.ris *.bib *.bibtex"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.df = core.read_records_file(path).reset_index(drop=True)
+        except Exception as exc:
+            messagebox.showerror("Couldn't read file", f"Failed to read this file:\n{exc}")
+            return
+        self.file_path, self.output_df = path, None
+        columns = list(self.df.columns)
+        for menu, aliases in ((self.title_col, core.TITLE_ALIASES),
+                              (self.abstract_col, abstract_tools.ABSTRACT_ALIASES)):
+            menu.configure(values=[NO_COLUMN] + columns)
+            menu.set(abstract_tools.guess_column(columns, aliases) or NO_COLUMN)
+        encoding = self.df.attrs.get("source_encoding")
+        self.file_label.configure(
+            text=f"{os.path.basename(path)} ({len(self.df):,} records)" + (f" · {encoding}" if encoding else ""))
+        self.run_btn.configure(state="normal")
+        self.export_btn.configure(state="disabled")
+        self.progress.set(0); self.table.set_rows([])
+
+    def on_run(self):
+        if self.df is None or self.running:
+            return
+        title_column = None if self.title_col.get() == NO_COLUMN else self.title_col.get()
+        abstract_column = None if self.abstract_col.get() == NO_COLUMN else self.abstract_col.get()
+        columns = [column for column in (title_column, abstract_column) if column]
+        if not columns:
+            messagebox.showwarning(
+                "Nothing to translate", "Choose a Title and/or Abstract column to translate.")
+            return
+        provider = self._current_provider()
+        target_label = self.language_menu.get()
+        target_lang = translate_tools.language_code(target_label, provider)
+        if not target_lang:
+            messagebox.showwarning(
+                "Language not supported",
+                f"{translate_tools.PROVIDER_LABELS[provider]} has no code for {target_label!r}.")
+            return
+        saved = core.load_settings()
+        if provider == "azure":
+            api_key, region = saved.get("translate_azure_key"), saved.get("translate_azure_region")
+            if not api_key or not region:
+                messagebox.showwarning(
+                    "Missing API key", "Add an Azure Translator API key and region under Settings first.")
+                return
+        elif provider == "deepl":
+            api_key, region = saved.get("translate_deepl_key"), None
+            if not api_key:
+                messagebox.showwarning("Missing API key", "Add a DeepL API key under Settings first.")
+                return
+        else:  # mymemory - no key required at all, an email is only an optional quota boost
+            api_key, region = saved.get("translate_mymemory_email") or None, None
+
+        self.running = True; self.cancel_event.clear(); self.progress.set(0)
+        self.run_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
+        self.export_btn.configure(state="disabled")
+        self.status_var.set(f"Translating with {translate_tools.PROVIDER_LABELS[provider]}…")
+
+        def worker():
+            try:
+                result_df, done, total, stats = translate_tools.translate_dataframe_fields(
+                    self.df, columns, target_lang, provider, api_key, region=region,
+                    overwrite_existing=self.overwrite_var.get(),
+                    cancel_event=self.cancel_event,
+                    progress_callback=lambda done, total: self.events.put(("progress", (done, total))))
+                self.events.put(("done", (result_df, title_column, abstract_column, done, total, stats)))
+            except translate_tools.TranslationError as exc:
+                self.events.put(("error", str(exc)))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_stop(self):
+        if self.running:
+            self.cancel_event.set()
+            self.status_var.set("Stopping after the current batch…")
+
+    def _poll_events(self):
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "progress":
+                    done, total = payload
+                    self.progress.set(done / max(1, total))
+                    self.status_var.set(f"Translated {done:,}/{total:,} records…")
+                elif kind == "done":
+                    self.output_df, title_column, abstract_column, done, total, stats = payload
+                    self.running = False
+                    self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
+                    self.export_btn.configure(state="normal")
+                    fields = ", ".join(f"'{c}'" for c in (title_column, abstract_column) if c)
+                    if done < total:
+                        self.status_var.set(f"Stopped after {done:,}/{total:,} — {fields} updated so far.")
+                    else:
+                        self.status_var.set(f"Done. {fields} translated in place.")
+                    _set_readonly_text(self.stats_box, translate_tools.format_stats_summary(stats))
+                    self._show_results(title_column, abstract_column)
+                elif kind == "error":
+                    self.running = False
+                    self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
+                    messagebox.showerror("Translation failed", payload)
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_events)
+
+    def _show_results(self, title_column, abstract_column):
+        rows = []
+        for _, row in self.output_df.head(250).iterrows():
+            rows.append((
+                abstract_tools.clean_value(row.get(title_column, ""))[:300] if title_column else "",
+                abstract_tools.clean_value(row.get(abstract_column, ""))[:300] if abstract_column else "",
+            ))
+        self.table.set_rows(rows)
+
+    def on_export(self):
+        if self.output_df is not None:
+            _save_enriched_dataframe(self, self.output_df, self.file_path, "translated")
 
 
 if __name__ == "__main__":

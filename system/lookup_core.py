@@ -1633,8 +1633,14 @@ def load_settings():
 
 
 def save_settings(settings: dict):
+    """Merge into the persisted settings rather than replacing them outright,
+    since multiple pages (Sources, Translate, ...) each save their own slice
+    of this one shared file - an overwrite would wipe out whatever the other
+    pages had already saved."""
+    current = load_settings()
+    current.update(settings)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
+        json.dump(current, f, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
