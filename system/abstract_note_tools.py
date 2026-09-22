@@ -66,17 +66,80 @@ def _replace_abstract_review_tag(value, review_tag):
     return "; ".join(tags)
 
 
+def _trim_url(match):
+    url = match.rstrip(".,;:!?>")
+    for closing, opening in ((")", "("), ("]", "["), ("}", "{")):
+        while url.endswith(closing) and url.count(closing) > url.count(opening):
+            url = url[:-1]
+    return url
+
+
 def extract_urls_from_note(note):
     """Return unique HTTP(S) links in order, including links inside HTML notes."""
     found = []
     for match in URL_RE.findall(unescape(clean_value(note))):
-        url = match.rstrip(".,;:!?>")
-        for closing, opening in ((")", "("), ("]", "["), ("}", "{")):
-            while url.endswith(closing) and url.count(closing) > url.count(opening):
-                url = url[:-1]
+        url = _trim_url(match)
         if url and url not in found:
             found.append(url)
     return found
+
+
+ISSP_ONLY_RE = re.compile(r"^\W*issp\W*$", re.IGNORECASE)
+_EMPTY_TAG_RE = re.compile(r"<(p|div|span|li|ul|ol)\b[^>]*>(?:\s|<br\s*/?>|&nbsp;)*</\1>", re.IGNORECASE)
+
+
+def _plain_text(value):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(clean_value(value)))).strip()
+
+
+def is_issp_only_note(note):
+    """True when the Note contains nothing but the word 'ISSP' (ignoring HTML and punctuation)."""
+    return bool(ISSP_ONLY_RE.match(_plain_text(note)))
+
+
+def _url_key(url):
+    return unescape(str(url)).strip().rstrip("/").casefold()
+
+
+def remove_links_from_note(note, links):
+    """Remove the given links from a Note, including HTML anchors pointing at them.
+
+    Returns (new_note, number_of_links_removed). All other Note text is kept; a
+    Note left with no visible text becomes an empty string."""
+    text = clean_value(note)
+    keys = {_url_key(link) for link in links if link}
+    if not text or not keys:
+        return text, 0
+    removed = 0
+
+    def drop_anchor(match):
+        nonlocal removed
+        if _url_key(match.group("href")) in keys:
+            removed += 1
+            return ""
+        return match.group(0)
+
+    def drop_bare(match):
+        nonlocal removed
+        raw = match.group(0)
+        url = _trim_url(unescape(raw))
+        if _url_key(url) in keys:
+            removed += 1
+            return raw[len(url):] if raw.startswith(url) else ""
+        return raw
+
+    text = re.sub(r"<a\b[^>]*?href\s*=\s*[\"'](?P<href>[^\"']*)[\"'][^>]*>.*?</a>",
+                  drop_anchor, text, flags=re.IGNORECASE | re.DOTALL)
+    text = URL_RE.sub(drop_bare, text)
+    if not removed:
+        return clean_value(note), 0
+    text = re.sub(r"\(\s*\)|\[\s*\]", "", text)
+    previous = None
+    while previous != text:
+        previous = text
+        text = _EMPTY_TAG_RE.sub("", text)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    return ("" if not _plain_text(text) else text), removed
 
 
 def record_link(row, url_column=None, doi_column=None):
@@ -92,8 +155,15 @@ def record_link(row, url_column=None, doi_column=None):
     return f"https://doi.org/{doi}"
 
 
-def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, doi_column=None):
-    """Add the first Note URL only when the record has neither URL nor DOI."""
+def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, doi_column=None,
+                                remove_imported_links=False, remove_issp_only_notes=False):
+    """Add the first Note URL only when the record has neither URL nor DOI.
+
+    Both cleanups are optional and only change the returned copy:
+    - remove_imported_links: delete from the Note every link that now sits in the
+      record's URL/DOI field (the recovered one, or one that was already there).
+    - remove_issp_only_notes: clear a Note whose whole content is just "ISSP"
+      (checked after link removal, so a Note of "ISSP" plus a removed link counts)."""
     frame = dataframe.copy()
     note_column = note_column or guess_column(frame.columns, NOTE_ALIASES)
     url_column = url_column or guess_column(frame.columns, URL_ALIASES)
@@ -106,6 +176,7 @@ def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, do
 
     before_links, notes, link_and_note = 0, 0, 0
     no_link_with_note, no_link_note_url, added = 0, 0, 0
+    links_removed, notes_changed_by_link, issp_cleared = 0, 0, 0
     for index, row in frame.iterrows():
         note = clean_value(row.get(note_column, "")) if note_column else ""
         link_before = record_link(row, url_column, doi_column)
@@ -125,6 +196,21 @@ def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, do
             frame.at[index, url_column] = urls[0]
             frame.at[index, "Link Added From Note"] = True
             added += 1
+        if note_column and note and (remove_imported_links or remove_issp_only_notes):
+            new_note = note
+            if remove_imported_links:
+                final_link = record_link(frame.loc[index], url_column, doi_column)
+                new_note, count = remove_links_from_note(
+                    note, [final_link, clean_value(frame.at[index, url_column]),
+                           clean_value(row.get(doi_column, "")) if doi_column else ""])
+                links_removed += count
+                notes_changed_by_link += bool(count)
+            if remove_issp_only_notes and is_issp_only_note(new_note):
+                new_note = ""
+                issp_cleared += 1
+            if new_note != note:
+                frame[note_column] = frame[note_column].astype(object)
+                frame.at[index, note_column] = new_note
 
     after_links = sum(bool(record_link(row, url_column, doi_column)) for _, row in frame.iterrows())
     total = len(frame)
@@ -140,6 +226,9 @@ def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, do
         "Records without a link before recovery that gained a link from Note": added,
         "Records with a link after Note recovery": after_links,
         "Records still without a link": total - after_links,
+        "Links removed from Notes": links_removed,
+        "Notes changed by link removal": notes_changed_by_link,
+        "ISSP-only Notes cleared": issp_cleared,
     }
     return frame, stats, {"note_column": note_column, "url_column": url_column, "doi_column": doi_column}
 

@@ -677,6 +677,16 @@ class NoteLinkRecoveryPage(ctk.CTkFrame):
         self.analyze_btn = ctk.CTkButton(settings, text="Analyze notes & add missing links", width=220,
                                          command=self.on_analyze, state="disabled")
         self.analyze_btn.grid(row=1, column=3, padx=10, pady=(0, 10))
+        self.remove_links_var = ctk.BooleanVar(value=False)
+        self.remove_issp_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            settings, text="Remove links from Notes once they are in the URL/DOI field",
+            variable=self.remove_links_var).grid(
+                row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        ctk.CTkCheckBox(
+            settings, text="Clear Notes that contain only \"ISSP\"",
+            variable=self.remove_issp_var).grid(
+                row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 10))
 
         self.stats_box = ctk.CTkTextbox(self, height=175, wrap="word", font=ctk.CTkFont(size=14))
         self.stats_box.pack(fill="x", padx=4, pady=(0, 8))
@@ -729,7 +739,9 @@ class NoteLinkRecoveryPage(ctk.CTkFrame):
         url = None if self.url_col.get() == NO_COLUMN else self.url_col.get()
         doi = None if self.doi_col.get() == NO_COLUMN else self.doi_col.get()
         self.output_df, stats, columns = abstract_tools.analyze_notes_and_add_links(
-            self.df, note_column=note, url_column=url, doi_column=doi)
+            self.df, note_column=note, url_column=url, doi_column=doi,
+            remove_imported_links=self.remove_links_var.get(),
+            remove_issp_only_notes=self.remove_issp_var.get())
         self._show_stats(stats)
         title_col = core.guess_column(self.output_df.columns, core.TITLE_ALIASES)
         rows = []
@@ -756,6 +768,11 @@ class NoteLinkRecoveryPage(ctk.CTkFrame):
             lines.append(
                 f"{label}: {count:,} ({count / total:.1%})"
                 if stats_key != "Total records" else f"{label}: {count:,}")
+        if self.remove_links_var.get():
+            lines.append(f"Links removed from Notes: {stats.get('Links removed from Notes', 0):,} "
+                         f"(in {stats.get('Notes changed by link removal', 0):,} records)")
+        if self.remove_issp_var.get():
+            lines.append(f"ISSP-only Notes cleared: {stats.get('ISSP-only Notes cleared', 0):,}")
         _set_readonly_text(self.stats_box, "\n".join(lines))
 
     def on_export(self):

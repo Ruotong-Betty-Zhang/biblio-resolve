@@ -520,6 +520,40 @@ class AbstractNoteToolsTests(unittest.TestCase):
         self.assertNotIn("Page 5", short_text)
         self.assertIn("Page 5", long_text)
 
+    def test_note_cleanup_is_optional_and_removes_imported_links(self):
+        frame = pd.DataFrame({
+            "Title": ["A", "B", "C", "D"],
+            "Url": ["", "https://x.org/b", "", ""],
+            "DOI": ["", "", "", ""],
+            "Notes": ["See https://a.org/paper. Reviewed.",
+                      '<p><a href="https://x.org/b">https://x.org/b</a></p>',
+                      "ISSP",
+                      "<p>ISSP https://d.org/d</p>"],
+        })
+        plain, stats, _ = tools.analyze_notes_and_add_links(frame)
+        self.assertEqual(plain.at[0, "Notes"], frame.at[0, "Notes"])
+        self.assertEqual(plain.at[2, "Notes"], "ISSP")
+        self.assertEqual(stats["Links removed from Notes"], 0)
+
+        cleaned, stats, _ = tools.analyze_notes_and_add_links(
+            frame, remove_imported_links=True, remove_issp_only_notes=True)
+        self.assertEqual(cleaned.at[0, "Url"], "https://a.org/paper")
+        self.assertEqual(cleaned.at[0, "Notes"], "See . Reviewed.")
+        self.assertEqual(cleaned.at[1, "Notes"], "")
+        self.assertEqual(cleaned.at[2, "Notes"], "")
+        self.assertEqual(cleaned.at[3, "Notes"], "")
+        self.assertEqual(stats["Links removed from Notes"], 3)
+        self.assertEqual(stats["ISSP-only Notes cleared"], 2)
+        self.assertEqual(frame.at[2, "Notes"], "ISSP")  # source frame untouched
+
+    def test_issp_only_clear_does_not_touch_real_notes(self):
+        frame = pd.DataFrame({"Title": ["A", "B"], "Url": ["", ""], "DOI": ["", ""],
+                              "Notes": ["ISSP 2016 Work Orientations", "issp."]})
+        out, stats, _ = tools.analyze_notes_and_add_links(frame, remove_issp_only_notes=True)
+        self.assertEqual(out.at[0, "Notes"], "ISSP 2016 Work Orientations")
+        self.assertEqual(out.at[1, "Notes"], "")
+        self.assertEqual(stats["ISSP-only Notes cleared"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
