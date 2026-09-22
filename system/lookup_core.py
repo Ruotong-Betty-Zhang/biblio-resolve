@@ -1680,11 +1680,70 @@ def is_uppercase_tag(tag):
     return any(char.isalpha() for char in text) and text.isupper()
 
 
-def clean_uppercase_tags(value, delimiter="Auto"):
+COUNTRY_NAMES = [
+    "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Antigua and Barbuda", "Argentina",
+    "Armenia", "Australia", "Austria", "Azerbaijan", "Bahamas", "Bahrain", "Bangladesh", "Barbados",
+    "Belarus", "Belgium", "Belize", "Benin", "Bhutan", "Bolivia", "Bosnia and Herzegovina",
+    "Botswana", "Brazil", "Brunei", "Bulgaria", "Burkina Faso", "Burundi", "Cabo Verde", "Cambodia",
+    "Cameroon", "Canada", "Central African Republic", "Chad", "Chile", "China", "Colombia", "Comoros",
+    "Congo", "Costa Rica", "Cote d'Ivoire", "Ivory Coast", "Croatia", "Cuba", "Cyprus",
+    "Czech Republic", "Czechia", "Denmark", "Djibouti", "Dominica", "Dominican Republic", "Ecuador",
+    "Egypt", "El Salvador", "Equatorial Guinea", "Eritrea", "Estonia", "Eswatini", "Swaziland",
+    "Ethiopia", "Fiji", "Finland", "France", "Gabon", "Gambia", "Georgia", "Germany", "Ghana",
+    "Greece", "Grenada", "Guatemala", "Guinea", "Guinea-Bissau", "Guyana", "Haiti", "Honduras",
+    "Hong Kong", "Hungary", "Iceland", "India", "Indonesia", "Iran", "Iraq", "Ireland", "Israel",
+    "Italy", "Jamaica", "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati", "Kosovo", "Kuwait",
+    "Kyrgyzstan", "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia", "Libya", "Liechtenstein",
+    "Lithuania", "Luxembourg", "Macao", "Macau", "Madagascar", "Malawi", "Malaysia", "Maldives",
+    "Mali", "Malta", "Marshall Islands", "Mauritania", "Mauritius", "Mexico", "Micronesia",
+    "Moldova", "Monaco", "Mongolia", "Montenegro", "Morocco", "Mozambique", "Myanmar", "Burma",
+    "Namibia", "Nauru", "Nepal", "Netherlands", "New Zealand", "Nicaragua", "Niger", "Nigeria",
+    "North Korea", "North Macedonia", "Macedonia", "Norway", "Oman", "Pakistan", "Palau",
+    "Palestine", "Panama", "Papua New Guinea", "Paraguay", "Peru", "Philippines", "Poland",
+    "Portugal", "Puerto Rico", "Qatar", "Romania", "Russia", "Russian Federation", "Rwanda",
+    "Saint Kitts and Nevis", "Saint Lucia", "Saint Vincent and the Grenadines", "Samoa",
+    "San Marino", "Sao Tome and Principe", "Saudi Arabia", "Senegal", "Serbia", "Seychelles",
+    "Sierra Leone", "Singapore", "Slovakia", "Slovenia", "Solomon Islands", "Somalia",
+    "South Africa", "South Korea", "Republic of Korea", "South Sudan", "Spain", "Sri Lanka",
+    "Sudan", "Suriname", "Sweden", "Switzerland", "Syria", "Taiwan", "Tajikistan", "Tanzania",
+    "Thailand", "Timor-Leste", "East Timor", "Togo", "Tonga", "Trinidad and Tobago", "Tunisia",
+    "Turkey", "Turkiye", "Türkiye", "Turkmenistan", "Tuvalu", "Uganda", "Ukraine",
+    "United Arab Emirates", "United Kingdom", "Great Britain", "Britain", "England", "Scotland",
+    "Wales", "Northern Ireland", "United States", "United States of America", "Uruguay",
+    "Uzbekistan", "Vanuatu", "Vatican City", "Venezuela", "Vietnam", "Viet Nam", "Yemen",
+    "Zambia", "Zimbabwe",
+]
+# Abbreviations are matched case-sensitively so "US" is not confused with "us".
+COUNTRY_ABBREVIATIONS = ["USA", "US", "U.S.", "U.S.A.", "UK", "U.K.", "UAE", "DPRK", "PRC"]
+_COUNTRY_NAME_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(name) for name in sorted(COUNTRY_NAMES, key=len, reverse=True))
+    + r")(?!\w)", re.IGNORECASE)
+_COUNTRY_ABBREVIATION_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(name) for name in sorted(COUNTRY_ABBREVIATIONS, key=len, reverse=True))
+    + r")(?!\w)")
+
+
+def contains_country_tag(tag):
+    """True if the keyword mentions a country, e.g. "Germany", "DATA - Japan", "cross-national USA"."""
+    text = str(tag or "").strip()
+    return bool(text and (_COUNTRY_NAME_RE.search(text) or _COUNTRY_ABBREVIATION_RE.search(text)))
+
+
+def clean_tags(value, delimiter="Auto", keep_uppercase=True, keep_countries=False):
+    """Keep keywords that are all-uppercase and/or mention a country (a keyword
+    passing either enabled rule is kept); everything else is removed."""
     tags, output_separator = split_tags(value, delimiter)
-    kept = [tag for tag in tags if is_uppercase_tag(tag)]
-    removed = [tag for tag in tags if not is_uppercase_tag(tag)]
+
+    def keep(tag):
+        return (keep_uppercase and is_uppercase_tag(tag)) or (keep_countries and contains_country_tag(tag))
+
+    kept = [tag for tag in tags if keep(tag)]
+    removed = [tag for tag in tags if not keep(tag)]
     return output_separator.join(kept), kept, removed
+
+
+def clean_uppercase_tags(value, delimiter="Auto"):
+    return clean_tags(value, delimiter, keep_uppercase=True, keep_countries=False)
 
 
 def guess_column(columns, aliases):

@@ -1317,8 +1317,9 @@ class TagCleanupPage(ctk.CTkFrame):
                          fill="x", padx=12, pady=(12, 4))
         ctk.CTkLabel(
             self,
-            text=("Keep only keywords whose letters are all uppercase (for example: IST, SURVEY DESIGN, "
-                  "COVID-19). Mixed-case and lowercase keywords are removed. The source file is never overwritten."),
+            text=("Keep keywords whose letters are all uppercase (for example: IST, SURVEY DESIGN, "
+                  "COVID-19) and/or keywords that contain a country name (for example: Germany, DATA - Japan). "
+                  "Every other keyword is removed. The source file is never overwritten."),
             anchor="w", justify="left", wraplength=1050,
             text_color=("gray25", "gray75")).pack(fill="x", padx=12, pady=(0, 10))
 
@@ -1348,11 +1349,21 @@ class TagCleanupPage(ctk.CTkFrame):
                                         command=self.on_export, state="disabled")
         self.export_btn.pack(side="right", padx=12, pady=10)
 
+        rules = ctk.CTkFrame(self)
+        rules.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkLabel(rules, text="Keep keywords that are").pack(side="left", padx=(12, 10), pady=8)
+        self.keep_upper_var = ctk.BooleanVar(value=True)
+        self.keep_country_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(rules, text="all uppercase (IST, SURVEY DESIGN)",
+                        variable=self.keep_upper_var).pack(side="left", padx=(0, 16), pady=8)
+        ctk.CTkCheckBox(rules, text="or contain a country (Germany, DATA - Japan, USA)",
+                        variable=self.keep_country_var).pack(side="left", pady=8)
+
         self.status_var = ctk.StringVar(value="No file loaded.")
         ctk.CTkLabel(self, textvariable=self.status_var, anchor="w",
                      text_color=("gray30", "gray70")).pack(fill="x", padx=12, pady=(0, 6))
         self.table = ResultsTable(
-            self, headers=["Record", "Original keywords", "Kept uppercase keywords", "Removed keywords"],
+            self, headers=["Record", "Original keywords", "Kept keywords", "Removed keywords"],
             weights=[1, 2, 2, 2])
         self.table.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
@@ -1398,7 +1409,7 @@ class TagCleanupPage(ctk.CTkFrame):
         if manual_tags_column and automatic_tags_column:
             self.status_var.set(
                 "Manual Tags and Automatic Tags detected. Manual Tags is selected by default; "
-                "only uppercase keywords in the selected field will be kept.")
+                "only keywords matching the ticked keep rules in the selected field will be kept.")
         else:
             self.status_var.set("Keywords field auto-detected. Confirm it, then preview the cleanup.")
 
@@ -1410,14 +1421,19 @@ class TagCleanupPage(ctk.CTkFrame):
         if column == NO_COLUMN:
             messagebox.showwarning("Missing Keywords field", "Choose the field containing keywords.")
             return
+        keep_upper, keep_country = self.keep_upper_var.get(), self.keep_country_var.get()
+        if not (keep_upper or keep_country):
+            messagebox.showwarning("No keep rule", "Tick at least one rule for keywords to keep.")
+            return
         output = self.df.copy()
         preview_rows, kept_total, removed_total, changed_records = [], 0, 0, 0
-        headings = ["Record", "Original keywords", "Kept uppercase keywords", "Removed keywords"]
+        headings = ["Record", "Original keywords", "Kept keywords", "Removed keywords"]
         for column_id, heading in zip(self.table.tree["columns"], headings):
             self.table.tree.heading(column_id, text=heading)
         for index, value in output[column].items():
             original = "" if pd.isna(value) else str(value).strip()
-            cleaned, kept, removed = core.clean_uppercase_tags(original, self.delimiter.get())
+            cleaned, kept, removed = core.clean_tags(
+                original, self.delimiter.get(), keep_uppercase=keep_upper, keep_countries=keep_country)
             output.at[index, column] = cleaned
             kept_total += len(kept)
             removed_total += len(removed)
@@ -1428,7 +1444,7 @@ class TagCleanupPage(ctk.CTkFrame):
         self.table.set_rows(preview_rows)
         self.export_btn.configure(state="normal")
         self.status_var.set(
-            f"Preview ready: {kept_total} uppercase keywords kept; {removed_total} keywords removed "
+            f"Preview ready: {kept_total} keywords kept; {removed_total} keywords removed "
             f"from {changed_records} of {len(output)} records.")
 
     def on_export(self):

@@ -105,6 +105,19 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(kept, ["IST", "SURVEY DESIGN", "COVID-19"])
         self.assertEqual(removed, ["automatic tag", "MixedCase", "2024"])
 
+    def test_tag_cleanup_can_also_keep_keywords_containing_a_country(self):
+        cleaned, kept, removed = core.clean_tags(
+            "IST; Germany; DATA - Japan; cross-national USA; automatic tag; Indiana; us and them; South Africa survey",
+            keep_uppercase=True, keep_countries=True)
+        self.assertEqual(kept, ["IST", "Germany", "DATA - Japan", "cross-national USA", "South Africa survey"])
+        self.assertEqual(removed, ["automatic tag", "Indiana", "us and them"])
+        self.assertEqual(cleaned, "IST; Germany; DATA - Japan; cross-national USA; South Africa survey")
+        # Country rule alone drops uppercase-only keywords; the old helper is unchanged.
+        _, kept_only_country, _ = core.clean_tags("IST; Germany", keep_uppercase=False, keep_countries=True)
+        self.assertEqual(kept_only_country, ["Germany"])
+        _, kept_upper, _ = core.clean_uppercase_tags("IST; Germany")
+        self.assertEqual(kept_upper, ["IST"])
+
     def test_tag_cleanup_supports_newline_separator(self):
         cleaned, kept, removed = core.clean_uppercase_tags("IST\nimported\nMODULE A", "New line")
         self.assertEqual(cleaned, "IST\nMODULE A")
