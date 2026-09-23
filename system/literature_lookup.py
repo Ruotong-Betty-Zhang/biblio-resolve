@@ -3415,6 +3415,8 @@ class BatchLookupPage(ctk.CTkFrame):
         self.output_df = None
         self.batch_running = False
         self.start_time = None
+        self._last_doi_col = NO_COLUMN
+        self._last_url_col = NO_COLUMN
 
         # 1. Choose a file
         file_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -3440,6 +3442,80 @@ class BatchLookupPage(ctk.CTkFrame):
         ctk.CTkLabel(mapping_row, text="Year column").pack(side="left", padx=(0, 6))
         self.year_col = ctk.CTkOptionMenu(mapping_row, values=[NO_COLUMN], width=150)
         self.year_col.pack(side="left")
+
+        mapping_row2 = ctk.CTkFrame(mapping_frame, fg_color="transparent")
+        mapping_row2.pack(fill="x", padx=10, pady=(0, 10))
+
+        ctk.CTkLabel(mapping_row2, text="DOI column").pack(side="left", padx=(0, 6))
+        self.doi_col = ctk.CTkOptionMenu(mapping_row2, values=[NO_COLUMN], width=170)
+        self.doi_col.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(mapping_row2, text="URL column").pack(side="left", padx=(0, 6))
+        self.url_col = ctk.CTkOptionMenu(mapping_row2, values=[NO_COLUMN], width=170)
+        self.url_col.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(mapping_row2, text="Item type column").pack(side="left", padx=(0, 6))
+        self.item_type_col = ctk.CTkOptionMenu(mapping_row2, values=[NO_COLUMN], width=150)
+        self.item_type_col.pack(side="left")
+        ctk.CTkLabel(
+            mapping_frame,
+            text="DOI/URL columns decide which records already have a link and control the "
+                 "\"only missing\" scope below. Item type lets type-restricted sources (e.g. Google "
+                 "Books, only for Book/Book Section) fire — without it, they're skipped entirely "
+                 "rather than guessed at, to protect their limited quota.",
+            text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11), anchor="w", justify="left",
+            wraplength=950,
+        ).pack(fill="x", padx=10, pady=(0, 10))
+
+        # 2b. Scope: everything, or only records still missing a DOI or URL
+        scope_frame = ctk.CTkFrame(self)
+        scope_frame.pack(fill="x", padx=4, pady=(0, 10))
+        ctk.CTkLabel(scope_frame, text="Which records to look up", font=ctk.CTkFont(weight="bold")) \
+            .pack(anchor="w", padx=10, pady=(10, 4))
+        self.scope_var = ctk.StringVar(value="missing_only")
+        ctk.CTkRadioButton(
+            scope_frame, text="Only records missing a DOI or a URL (recommended — fills gaps, saves quota)",
+            variable=self.scope_var, value="missing_only",
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        ctk.CTkRadioButton(
+            scope_frame,
+            text="Only records missing BOTH a DOI and a URL (most conservative — a record that already has "
+                 "either one is skipped entirely, so a fresh search can never end up replacing an existing, "
+                 "correct value with a different match)",
+            variable=self.scope_var, value="missing_both",
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        ctk.CTkRadioButton(
+            scope_frame, text="All records (re-searches everything, including rows that already have both)",
+            variable=self.scope_var, value="all",
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        ctk.CTkLabel(
+            scope_frame,
+            text="Whichever you pick, a record's existing DOI/URL is only ever replaced by a newly found "
+                 "value — a row this run doesn't find anything for keeps what it already had, it is never "
+                 "blanked out. \"Missing both\" is the only option that guarantees an already-filled field is "
+                 "never touched at all, even by a different match; \"Missing a DOI or a URL\" may still "
+                 "re-search (and, if it finds a different paper, replace) the field you already had, while "
+                 "trying to fill in the one you didn't.",
+            text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11), anchor="w", justify="left",
+            wraplength=950,
+        ).pack(fill="x", padx=10, pady=(0, 10))
+
+        self.clear_cache_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            scope_frame, text="Clear cached results before running",
+            variable=self.clear_cache_var,
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        ctk.CTkLabel(
+            scope_frame,
+            text="This app caches every lookup result (by title/author/year/sources/item type/existing DOI) "
+                 "so re-running the same file doesn't re-query the APIs for rows it already resolved. Leave "
+                 "this unchecked to reuse that cache (faster, fewer requests). Check it to force every "
+                 "selected record to be looked up fresh — e.g. after changing which sources are enabled, "
+                 "after this app added new sources, or if you suspect a cached result is stale/wrong. This "
+                 "clears the shared lookup cache file, so it also affects Single Lookup.",
+            text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11), anchor="w", justify="left",
+            wraplength=950,
+        ).pack(fill="x", padx=10, pady=(0, 10))
 
         # 3. Concurrency
         workers_frame = ctk.CTkFrame(self)
@@ -3539,6 +3615,9 @@ class BatchLookupPage(ctk.CTkFrame):
         title_guess = core.guess_column(columns, core.TITLE_ALIASES) or columns[0]
         author_guess = core.guess_column(columns, core.AUTHOR_ALIASES)
         year_guess = core.guess_column(columns, core.YEAR_ALIASES)
+        doi_guess = abstract_tools.guess_column(columns, abstract_tools.DOI_ALIASES)
+        url_guess = abstract_tools.guess_column(columns, abstract_tools.URL_ALIASES)
+        item_type_guess = core.guess_column(columns, core.ITEM_TYPE_ALIASES)
 
         self.title_col.configure(values=columns)
         self.title_col.set(title_guess)
@@ -3548,6 +3627,15 @@ class BatchLookupPage(ctk.CTkFrame):
 
         self.year_col.configure(values=[NO_COLUMN] + columns)
         self.year_col.set(year_guess or NO_COLUMN)
+
+        self.doi_col.configure(values=[NO_COLUMN] + columns)
+        self.doi_col.set(doi_guess or NO_COLUMN)
+
+        self.url_col.configure(values=[NO_COLUMN] + columns)
+        self.url_col.set(url_guess or NO_COLUMN)
+
+        self.item_type_col.configure(values=[NO_COLUMN] + columns)
+        self.item_type_col.set(item_type_guess or NO_COLUMN)
 
         self.status_var.set("Columns auto-detected — fix them above if wrong, then click “Run batch lookup”.")
         self.export_btn.configure(state="disabled")
@@ -3563,6 +3651,9 @@ class BatchLookupPage(ctk.CTkFrame):
         title_col = self.title_col.get()
         author_col = self.author_col.get()
         year_col = self.year_col.get()
+        doi_col = self.doi_col.get()
+        url_col = self.url_col.get()
+        item_type_col = self.item_type_col.get()
         if title_col not in self.df.columns:
             messagebox.showwarning("Missing column", "Please choose a valid title column.")
             return
@@ -3572,7 +3663,33 @@ class BatchLookupPage(ctk.CTkFrame):
             messagebox.showwarning("No sources selected", "Please enable at least one source on the Sources tab.")
             return
 
+        scope = self.scope_var.get()
+        if scope in ("missing_only", "missing_both") and doi_col == NO_COLUMN and url_col == NO_COLUMN:
+            messagebox.showwarning(
+                "No DOI/URL column chosen",
+                "This scope needs at least a DOI or a URL column so it can tell which rows already have "
+                "one. Choose one above, or switch to \"All records\".")
+            return
+        if scope == "all" and (doi_col != NO_COLUMN or url_col != NO_COLUMN) and not messagebox.askyesno(
+                "Re-search every record?",
+                "\"All records\" re-searches and re-scores every row, including ones that already have "
+                "a DOI/URL. A row a source no longer finds a match for keeps its existing value "
+                "(nothing is ever blanked out), but any row that finds a different match will have its "
+                "DOI/URL replaced with the new one.\n\nContinue?"):
+            return
+
+        clear_cache = self.clear_cache_var.get()
+        if clear_cache and not messagebox.askyesno(
+                "Clear the lookup cache?",
+                "This deletes every previously cached lookup result (for every file, not just this one) "
+                "so this run looks everything up fresh. This also affects Single Lookup until it's rebuilt. "
+                "Continue?"):
+            return
+
         workers = int(round(self.workers_slider.get()))
+        self._last_doi_col, self._last_url_col = doi_col, url_col
+        if clear_cache:
+            core.clear_cache()
 
         self.start_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
@@ -3587,13 +3704,14 @@ class BatchLookupPage(ctk.CTkFrame):
 
         threading.Thread(
             target=self._batch_worker,
-            args=(title_col, author_col, year_col, enabled_sources,
+            args=(title_col, author_col, year_col, doi_col, url_col, item_type_col, scope, enabled_sources,
                   self.sources_page.get_email(), self.sources_page.get_s2_key(), self.sources_page.get_core_key(),
-                  workers),
+                  self.sources_page.get_lens_key(), workers),
             daemon=True,
         ).start()
 
-    def _batch_worker(self, title_col, author_col, year_col, enabled_sources, email, s2_key, core_key, workers):
+    def _batch_worker(self, title_col, author_col, year_col, doi_col, url_col, item_type_col, scope,
+                       enabled_sources, email, s2_key, core_key, lens_key, workers):
         df = self.df
         cache = core.load_cache()
         cache_lock = threading.Lock()
@@ -3621,14 +3739,34 @@ class BatchLookupPage(ctk.CTkFrame):
                 if year_raw.strip().lower() != "nan":
                     year = year_raw
 
-            key = core.cache_key(title, author, year, enabled_sources)
+            existing_doi = abstract_tools.clean_value(row.get(doi_col, "")) if doi_col != NO_COLUMN else ""
+            existing_url = abstract_tools.clean_value(row.get(url_col, "")) if url_col != NO_COLUMN else ""
+            item_type = abstract_tools.clean_value(row.get(item_type_col, "")) if item_type_col != NO_COLUMN else ""
+
+            # "missing_only" skips a row once it has BOTH; "missing_both" is
+            # more conservative and skips it the moment it has EITHER one -
+            # so a fresh search can never overwrite an already-correct
+            # value with a different match found while chasing the other,
+            # missing field. Either way, a skipped row's existing value(s)
+            # are carried forward untouched, without spending any source's
+            # quota on it.
+            already_has_enough = (
+                (existing_doi and existing_url) if scope == "missing_only" else
+                (existing_doi or existing_url) if scope == "missing_both" else False)
+            if already_has_enough:
+                return idx, {"status": "skipped_complete", "doi": existing_doi, "url": existing_url,
+                             "matched_title": "", "source": "", "score": 0, "failed_sources": []}
+
+            key = core.cache_key(title, author, year, enabled_sources, item_type=item_type, existing_doi=existing_doi)
             with cache_lock:
                 cached = cache.get(key)
             if cached is not None:
                 return idx, cached
 
             try:
-                res = core.lookup_one(title, author, year, enabled_sources, email=email, s2_api_key=s2_key, core_api_key=core_key)
+                res = core.lookup_one(title, author, year, enabled_sources, email=email, s2_api_key=s2_key,
+                                       core_api_key=core_key, lens_api_key=lens_key,
+                                       item_type=item_type, existing_doi=existing_doi)
             except Exception:
                 res = {"status": "not_found", "doi": "", "url": "", "matched_title": "", "source": "", "score": 0, "failed_sources": []}
 
@@ -3695,18 +3833,27 @@ class BatchLookupPage(ctk.CTkFrame):
         self.time_var.set(f"Finished in {_format_duration(elapsed)}.")
 
         result_df = self.df.copy().reset_index(drop=True)
+        # A row this run didn't find anything new for keeps whatever DOI/URL
+        # it already had (read from the mapped DOI/URL columns) rather than
+        # being blanked out - only a genuinely found value replaces it.
+        doi_col, url_col = self._last_doi_col, self._last_url_col
+        original_dois = ([abstract_tools.clean_value(v) for v in self.df.get(doi_col, [""] * len(self.df))]
+                          if doi_col != NO_COLUMN else [""] * len(self.df))
+        original_urls = ([abstract_tools.clean_value(v) for v in self.df.get(url_col, [""] * len(self.df))]
+                          if url_col != NO_COLUMN else [""] * len(self.df))
         result_df["Lookup Status"] = [STATUS_LABELS.get(r["status"], r["status"]) for r in results]
         result_df["Match Score"] = [r["score"] for r in results]
         result_df["Match Source"] = [r["source"] for r in results]
         result_df["Matched Title"] = [r["matched_title"] for r in results]
-        result_df["DOI"] = [r["doi"] for r in results]
-        result_df["Link"] = [r["url"] for r in results]
+        result_df["DOI"] = [r["doi"] or original for r, original in zip(results, original_dois)]
+        result_df["Link"] = [r["url"] or original for r, original in zip(results, original_urls)]
         result_df["Failed Sources"] = [_failed_sources_text(r.get("failed_sources")) for r in results]
         self.output_df = result_df
 
-        found = sum(1 for r in results if r["status"] in ("auto_accepted", "needs_review"))
+        found = sum(1 for r in results
+                    if r["status"] in ("auto_accepted", "needs_review", "url_enriched", "skipped_complete"))
         incomplete = sum(1 for r in results if r.get("failed_sources"))
-        done_msg = f"Done: {found}/{len(results)} records got a DOI/link."
+        done_msg = f"Done: {found}/{len(results)} records have a DOI/link."
         if incomplete:
             done_msg += f" {incomplete} record(s) had at least one source fail to respond — see the Failed Sources column."
         done_msg += " Click “Export results” to save."
@@ -3720,21 +3867,25 @@ class BatchLookupPage(ctk.CTkFrame):
             status_text = STATUS_LABELS.get(r["status"], r["status"])
             if r.get("failed_sources"):
                 status_text += " ⚠"
+            # Show the merged (possibly-preserved-original) DOI/Link from
+            # result_df, not the raw per-row result - a "not found" row that
+            # already had a DOI/URL still shows it here, matching the export.
+            merged_doi, merged_url = result_df["DOI"].iat[i], result_df["Link"].iat[i]
             preview_rows.append((
                 title_text[:60],
                 status_text,
                 f"{r['score']:.0f}",
                 r["source"],
-                r["doi"],
-                r["url"],
+                merged_doi,
+                merged_url,
             ))
             copy_rows.append((
                 title_text,
                 status_text,
                 f"{r['score']:.0f}",
                 r["source"],
-                r["doi"],
-                r["url"],
+                merged_doi,
+                merged_url,
             ))
         self.table.set_rows(preview_rows, copy_values=copy_rows)
         if len(results) > 200:
