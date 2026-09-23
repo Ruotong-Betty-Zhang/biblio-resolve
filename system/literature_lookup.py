@@ -88,6 +88,8 @@ STATUS_LABELS = {
     "not_found": "Not found",
     "incomplete": "Not found — search incomplete",
     "no_title": "Missing title",
+    "url_enriched": "URL added (Unpaywall)",
+    "skipped_complete": "Already had a DOI/URL — skipped",
     "unverified": "Unverifiable - insufficient metadata",
     "verified": "Verified",
     "verified_with_warning": "Verified with warning",
@@ -918,6 +920,7 @@ class AbstractFinderPage(ctk.CTkFrame):
         email = self.sources_page.get_email()
         s2_key = self.sources_page.get_s2_key()
         core_key = self.sources_page.get_core_key()
+        lens_key = self.sources_page.get_lens_key()
         if not enabled_sources and not url and not doi:
             messagebox.showwarning(
                 "Nothing to search",
@@ -934,7 +937,7 @@ class AbstractFinderPage(ctk.CTkFrame):
                 if enabled_sources:
                     source_lookup = lambda **record: core.lookup_abstract_from_sources(
                         **record, enabled_sources=enabled_sources, email=email,
-                        s2_api_key=s2_key, core_api_key=core_key)
+                        s2_api_key=s2_key, core_api_key=core_key, lens_api_key=lens_key)
                 abstract_cache = core.load_abstract_cache()
 
                 def cache_key(record):
@@ -2511,6 +2514,12 @@ class SourcesPage(ctk.CTkFrame):
             settings, "CORE API key", "required to use CORE below",
             "Only needed if you enable CORE below — CORE has no free/keyless search tier at all, so "
             "without a key it contributes nothing. Free registration at core.ac.uk/services/api.",
+        )
+        self.lens_key_entry = self._labeled_entry(
+            settings, "Lens.org API key", "required to use Lens.org below",
+            "Only needed if you enable Lens.org below — like CORE, it has no keyless tier. Unlike CORE, "
+            "even the free academic trial requires signing in at lens.org and requesting a token "
+            "(an approval step, not instant registration).",
             pady_bottom=10,
         )
 
@@ -2520,19 +2529,38 @@ class SourcesPage(ctk.CTkFrame):
         sources_scroll = ctk.CTkScrollableFrame(self)
         sources_scroll.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
+        # Grouped so a now-long source list stays scannable: broad,
+        # discipline-agnostic sources first, then single-country/single-
+        # discipline/key-gated ones after — see the "group" field on each
+        # entry in core.SOURCES.
+        GROUP_HEADINGS = {
+            "mainstream": "Mainstream (broad, cross-discipline)",
+            "specialized": "Specialized & regional",
+        }
         self.source_vars = {}
+        sources_by_group = {}
         for src in core.SOURCES:
-            row = ctk.CTkFrame(sources_scroll, fg_color="transparent")
-            row.pack(fill="x", pady=5)
-            var = ctk.BooleanVar(value=src["default_on"])
-            self.source_vars[src["id"]] = var
-            ctk.CTkCheckBox(
-                row, text=src["label"], variable=var, width=230, command=self._save_current_settings,
-            ).pack(side="left", anchor="n")
+            sources_by_group.setdefault(src.get("group", "mainstream"), []).append(src)
+        for group_index, group in enumerate(("mainstream", "specialized")):
+            group_sources = sources_by_group.get(group, [])
+            if not group_sources:
+                continue
             ctk.CTkLabel(
-                row, text=src["note"], text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11),
-                anchor="w", justify="left", wraplength=680,
-            ).pack(side="left", fill="x", expand=True, padx=(10, 0))
+                sources_scroll, text=GROUP_HEADINGS.get(group, group),
+                font=ctk.CTkFont(size=12, weight="bold"), text_color=("gray30", "gray70"), anchor="w",
+            ).pack(fill="x", pady=(10 if group_index else 0, 2))
+            for src in group_sources:
+                row = ctk.CTkFrame(sources_scroll, fg_color="transparent")
+                row.pack(fill="x", pady=5)
+                var = ctk.BooleanVar(value=src["default_on"])
+                self.source_vars[src["id"]] = var
+                ctk.CTkCheckBox(
+                    row, text=src["label"], variable=var, width=230, command=self._save_current_settings,
+                ).pack(side="left", anchor="n")
+                ctk.CTkLabel(
+                    row, text=src["note"], text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11),
+                    anchor="w", justify="left", wraplength=680,
+                ).pack(side="left", fill="x", expand=True, padx=(10, 0))
 
         ctk.CTkLabel(
             self, text="Your source selection and settings are saved automatically and restored next time you open the app.",
@@ -2544,7 +2572,7 @@ class SourcesPage(ctk.CTkFrame):
         # Save on every edit, not just on exit, so settings survive even if
         # the app is closed abruptly (crash, force-quit) rather than
         # relying on a clean shutdown hook.
-        for entry in (self.email_entry, self.s2_key_entry, self.core_key_entry):
+        for entry in (self.email_entry, self.s2_key_entry, self.core_key_entry, self.lens_key_entry):
             entry.bind("<FocusOut>", lambda e: self._save_current_settings())
             entry.bind("<Return>", lambda e: self._save_current_settings())
 
@@ -2573,6 +2601,7 @@ class SourcesPage(ctk.CTkFrame):
             (self.email_entry, "email"),
             (self.s2_key_entry, "s2_key"),
             (self.core_key_entry, "core_key"),
+            (self.lens_key_entry, "lens_key"),
         ):
             value = saved.get(key)
             if value:
@@ -2585,6 +2614,7 @@ class SourcesPage(ctk.CTkFrame):
             "email": self.get_email(),
             "s2_key": self.get_s2_key() or "",
             "core_key": self.get_core_key() or "",
+            "lens_key": self.get_lens_key() or "",
         })
 
     def get_enabled_sources(self):
@@ -2598,6 +2628,9 @@ class SourcesPage(ctk.CTkFrame):
 
     def get_core_key(self):
         return self.core_key_entry.get().strip() or None
+
+    def get_lens_key(self):
+        return self.lens_key_entry.get().strip() or None
 
 
 # ---------------------------------------------------------------------------
@@ -2764,13 +2797,15 @@ class SingleLookupPage(ctk.CTkFrame):
         threading.Thread(
             target=self._worker,
             args=(title, author, year, enabled_sources,
-                  self.sources_page.get_email(), self.sources_page.get_s2_key(), self.sources_page.get_core_key()),
+                  self.sources_page.get_email(), self.sources_page.get_s2_key(), self.sources_page.get_core_key(),
+                  self.sources_page.get_lens_key()),
             daemon=True,
         ).start()
 
-    def _worker(self, title, author, year, enabled_sources, email, s2_key, core_key):
+    def _worker(self, title, author, year, enabled_sources, email, s2_key, core_key, lens_key):
         try:
-            results, failed = core.run_search(title, author, year, enabled_sources, email=email, s2_api_key=s2_key, core_api_key=core_key)
+            results, failed = core.run_search(title, author, year, enabled_sources, email=email, s2_api_key=s2_key,
+                                               core_api_key=core_key, lens_api_key=lens_key)
             self.result_queue.put(("ok", (results, failed)))
         except Exception as e:
             self.result_queue.put(("error", str(e)))
@@ -2837,13 +2872,14 @@ class SingleLookupPage(ctk.CTkFrame):
                   self.year_entry.get().strip() if "year" in enabled_fields else "",
                   self.doi_entry.get(), self.url_entry.get(),
                   self.sources_page.get_enabled_sources(), self.sources_page.get_email(),
-                  self.sources_page.get_s2_key(), self.sources_page.get_core_key())
+                  self.sources_page.get_s2_key(), self.sources_page.get_core_key(), self.sources_page.get_lens_key())
         threading.Thread(target=self._verify_worker, args=values, daemon=True).start()
 
-    def _verify_worker(self, title, author, year, doi, url, enabled_sources, email, s2_key, core_key):
+    def _verify_worker(self, title, author, year, doi, url, enabled_sources, email, s2_key, core_key, lens_key):
         try:
             result = core.verify_reference(title, author, year, doi, url, enabled_sources=enabled_sources,
-                                           email=email, s2_api_key=s2_key, core_api_key=core_key)
+                                           email=email, s2_api_key=s2_key, core_api_key=core_key,
+                                           lens_api_key=lens_key)
             self.result_queue.put(("verification", result))
         except Exception as e:
             self.result_queue.put(("verification_error", str(e)))
@@ -3073,6 +3109,7 @@ class VerificationPage(ctk.CTkFrame):
         verification_fields = self.verification_settings_page.get_enabled_fields()
         source_settings = (self.sources_page.get_enabled_sources(), self.sources_page.get_email(),
                            self.sources_page.get_s2_key(), self.sources_page.get_core_key(),
+                           self.sources_page.get_lens_key(),
                            "high_confidence" if self.verification_mode.get() == "High confidence" else "fast")
         self.running, self.total_rows, self.done_rows, self.cached_rows = True, len(self.df), 0, 0
         self.start_time = time.monotonic()
@@ -3085,7 +3122,7 @@ class VerificationPage(ctk.CTkFrame):
         _set_readonly_text_autosize(self.verification_message_view, "Verification is running…")
         self.progress.set(0)
         source_names = ", ".join(core.source_label(s) for s in source_settings[0]) or "no additional sources"
-        if source_settings[4] == "high_confidence":
+        if source_settings[5] == "high_confidence":
             self.status_var.set(
                 f"Verifying 0/{self.total_rows} records · Independent confirmation sources: {source_names}")
         else:
@@ -3096,7 +3133,7 @@ class VerificationPage(ctk.CTkFrame):
 
     def _worker(self, columns, source_settings, verification_fields):
         title_col, author_col, year_col, doi_col, url_col = columns
-        enabled_sources, email, s2_key, core_key, verification_mode = source_settings
+        enabled_sources, email, s2_key, core_key, lens_key, verification_mode = source_settings
         results = [None] * len(self.df)
         cache = core.load_verification_cache()
         cache_lock = threading.Lock()
@@ -3131,8 +3168,8 @@ class VerificationPage(ctk.CTkFrame):
             try:
                 result = core.verify_reference(
                     title, author, year, doi, url, enabled_sources=enabled_sources,
-                    email=email, s2_api_key=s2_key, core_api_key=core_key, mode=verification_mode,
-                    **context)
+                    email=email, s2_api_key=s2_key, core_api_key=core_key, lens_api_key=lens_key,
+                    mode=verification_mode, **context)
             except Exception as exc:
                 result = {"status": "unavailable", "verified": False, "link_valid": False,
                           "paper_match": False, "score": 0, "metadata_title": "",

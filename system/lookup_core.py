@@ -1046,7 +1046,7 @@ def _canonical_url(value):
 
 
 def _verify_with_enabled_sources(title, author, year, doi, url, enabled_sources,
-                                 email="", s2_api_key=None, core_api_key=None,
+                                 email="", s2_api_key=None, core_api_key=None, lens_api_key=None,
                                  required_confirmations=1, bibliographic_context=None):
     """Cross-check selected sources in priority order, stopping on success."""
     target_doi = normalize_doi(doi) or _doi_from_url(url)
@@ -1063,7 +1063,7 @@ def _verify_with_enabled_sources(title, author, year, doi, url, enabled_sources,
         checked.append(source_id)
         try:
             candidates, error = _call_source(source_id, lib.clean_title(str(title or "")),
-                                             str(author or ""), email, s2_api_key, core_api_key)
+                                             str(author or ""), email, s2_api_key, core_api_key, lens_api_key)
         except Exception as exc:
             candidates, error = [], str(exc)
         if error:
@@ -1136,7 +1136,7 @@ def _verify_with_enabled_sources(title, author, year, doi, url, enabled_sources,
 
 
 def verify_reference(title, author="", year="", doi="", url="", session=None, timeout=VERIFY_TIMEOUT,
-                     enabled_sources=None, email="", s2_api_key=None, core_api_key=None,
+                     enabled_sources=None, email="", s2_api_key=None, core_api_key=None, lens_api_key=None,
                      mode="fast", item_type="", journal="", volume="", issue="", pages="",
                      isbn="", issn="", publisher="", container_title_hint=""):
     """Verify via DOI registries/web metadata, then selected sources as cross-checks."""
@@ -1174,7 +1174,7 @@ def verify_reference(title, author="", year="", doi="", url="", session=None, ti
     required = 1 if primary["verified"] or mode != "high_confidence" else 2
     source_result, checked, failures = _verify_with_enabled_sources(
         title, author, year, primary.get("doi") or doi, url, secondary_sources, email, s2_api_key, core_api_key,
-        required_confirmations=required, bibliographic_context=context)
+        lens_api_key, required_confirmations=required, bibliographic_context=context)
     primary["sources_checked"], primary["source_failures"] = checked, failures
     if source_result:
         source_result["verified_at"] = primary["verified_at"]
@@ -1204,42 +1204,87 @@ def verify_reference(title, author="", year="", doi="", url="", session=None, ti
 # `needs` lists which optional extra inputs (see SourcesPage in the GUI)
 # this source can use. "email" and "s2_api_key" are optional everywhere
 # they're accepted (the source still works without them, just with a
-# stricter rate limit or a less polite identification). "core_api_key" is
-# the one exception: CORE has no keyless tier at all, so it contributes
-# nothing unless a key is supplied.
+# stricter rate limit or a less polite identification). "core_api_key" and
+# "lens_api_key" are the exception: CORE and Lens.org have no keyless tier
+# at all, so they contribute nothing unless a key is supplied.
+#
+# `group` sorts the Sources tab into two sections so a long list stays
+# scannable: "mainstream" (broad, discipline-agnostic - shown first) and
+# "specialized" (a single country/language, a single discipline, or
+# key-gated - shown after, since most users won't need all of them).
+#
+# `restrict_languages`, when present, makes a source "regional": it is only
+# ever queried for a title whose detected language is in this set (see
+# ordered_lookup_sources() below). `restrict_item_type_families`, when
+# present, makes a source "type-restricted": it is only ever queried for a
+# record whose Item Type normalizes (via _item_type_family()) to one of
+# these families. Both exist to stop a quota-limited or narrowly-scoped
+# source from being burned on records it can't possibly help - e.g. a
+# German-only catalogue queried with an English title, or Google Books
+# queried for a journal article.
 SOURCES = [
-    {"id": "crossref", "label": "Crossref", "default_on": True, "needs": ["email"],
+    {"id": "crossref", "label": "Crossref", "default_on": True, "needs": ["email"], "group": "mainstream",
      "note": "General scholarly literature (journal articles, books, chapters). No key needed; "
              "an email is optional and only makes Crossref's rate limit more generous."},
-    {"id": "openalex", "label": "OpenAlex", "default_on": True, "needs": [],
+    {"id": "openalex", "label": "OpenAlex", "default_on": True, "needs": [], "group": "mainstream",
      "note": "Broad coverage including theses and working papers. No key needed."},
-    {"id": "semantic_scholar", "label": "Semantic Scholar", "default_on": True, "needs": ["s2_api_key"],
+    {"id": "semantic_scholar", "label": "Semantic Scholar", "default_on": True, "needs": ["s2_api_key"], "group": "mainstream",
      "note": "~200M papers across all fields. No key needed; an optional free API key raises the "
              "rate limit from ~100 requests/5min to 1/sec."},
-    {"id": "datacite", "label": "DataCite", "default_on": True, "needs": [],
+    {"id": "datacite", "label": "DataCite", "default_on": True, "needs": [], "group": "mainstream",
      "note": "DOIs for theses, datasets, and working papers that Crossref doesn't index. No key needed."},
-    {"id": "openaire", "label": "OpenAIRE", "default_on": False, "needs": [],
+    {"id": "openaire", "label": "OpenAIRE", "default_on": False, "needs": [], "group": "mainstream",
      "note": "European research output (funders/institutions). No key needed."},
-    {"id": "gesis", "label": "GESIS", "default_on": False, "needs": [],
+    {"id": "unpaywall", "label": "Unpaywall", "default_on": True, "needs": ["email"], "group": "mainstream",
+     "note": "Not a title search - fills in a missing URL for a record that already has a DOI (either "
+             "supplied or found by another source above), by looking up its open-access location. Free, "
+             "keyless; an email is used only as a courtesy identifier. Effectively free to leave on."},
+    {"id": "doaj", "label": "DOAJ", "default_on": False, "needs": [], "group": "mainstream",
+     "note": "Directory of Open Access Journals - cross-discipline open-access journal articles. No key needed."},
+
+    {"id": "gesis", "label": "GESIS", "default_on": False, "needs": [], "group": "specialized",
      "note": "German social-science data archive (ISSP, SSOAR). Best for social-science / German "
              "survey literature. No key needed."},
-    {"id": "core", "label": "CORE", "default_on": False, "needs": ["core_api_key"],
+    {"id": "core", "label": "CORE", "default_on": False, "needs": ["core_api_key"], "group": "specialized",
      "note": "300M+ records from institutional repositories worldwide. REQUIRES a free API key "
              "(register at core.ac.uk/services/api) - without one, CORE contributes nothing."},
-    {"id": "dnb", "label": "DNB (German National Library)", "default_on": False, "needs": [],
-     "note": "Germany's national bibliography. Best for German-language titles. No key needed."},
-    {"id": "hal", "label": "HAL (France)", "default_on": False, "needs": [],
-     "note": "France's national open-archive repository. Best for French-language titles. No key needed."},
-    {"id": "cinii", "label": "CiNii (Japan)", "default_on": False, "needs": [],
-     "note": "Japan's national scholarly search. Best for Japanese-language titles. No key needed."},
-    {"id": "arxiv", "label": "arXiv", "default_on": False, "needs": [],
+    {"id": "lens", "label": "Lens.org", "default_on": False, "needs": ["lens_api_key"], "group": "specialized",
+     "note": "Scholarly + patent literature. REQUIRES an API token - unlike CORE, even the free academic "
+             "trial needs a sign-in and approval step at lens.org, not instant self-service registration. "
+             "Without a key, Lens contributes nothing."},
+    {"id": "dnb", "label": "DNB (German National Library)", "default_on": False, "needs": [], "group": "specialized",
+     "restrict_languages": {"de"},
+     "note": "Germany's national bibliography. Only queried for titles detected as German. No key needed."},
+    {"id": "hal", "label": "HAL (France)", "default_on": False, "needs": [], "group": "specialized",
+     "restrict_languages": {"fr"},
+     "note": "France's national open-archive repository. Only queried for titles detected as French. No key needed."},
+    {"id": "cinii", "label": "CiNii (Japan)", "default_on": False, "needs": [], "group": "specialized",
+     "restrict_languages": {"ja"},
+     "note": "Japan's national scholarly search. Only queried for titles detected as Japanese. No key needed."},
+    {"id": "swisscovery", "label": "swisscovery (Switzerland)", "default_on": False, "needs": [], "group": "specialized",
+     "restrict_languages": {"de", "fr", "it"},
+     "note": "Shared catalog of the Swiss university libraries (SLSP). Only queried for titles detected as "
+             "German, French, or Italian. No key needed."},
+    {"id": "libris", "label": "Libris (Sweden)", "default_on": False, "needs": [], "group": "specialized",
+     "restrict_languages": {"sv"},
+     "note": "National Library of Sweden's union catalog. Only queried for titles detected as Swedish. No key needed."},
+    {"id": "europepmc", "label": "Europe PMC", "default_on": False, "needs": [], "group": "specialized",
+     "note": "Biomedical / life-science / public-health literature, incl. preprints PubMed doesn't index. "
+             "Overlaps PubMed below. No key needed."},
+    {"id": "google_books", "label": "Google Books", "default_on": False, "needs": [], "group": "specialized",
+     "restrict_item_type_families": {"book", "chapter"},
+     "note": "Only queried for records whose Item Type is Book or Book Section - never for journal "
+             "articles/conference papers, to avoid spending its (unreliable, keyless-throttled) quota where "
+             "it can't help. No key required; works better with a free Google Cloud API key."},
+    {"id": "arxiv", "label": "arXiv", "default_on": False, "needs": [], "group": "specialized",
      "note": "Physics, math, CS, and quantitative finance/economics preprints. No key needed."},
-    {"id": "pubmed", "label": "PubMed", "default_on": False, "needs": ["email"],
+    {"id": "pubmed", "label": "PubMed", "default_on": False, "needs": ["email"], "group": "specialized",
      "note": "Biomedical / life-science / public-health literature. No key needed; an email is optional."},
 ]
 
 DEFAULT_ENABLED_SOURCES = [s["id"] for s in SOURCES if s["default_on"]]
 SOURCE_LABELS = {s["id"]: s["label"] for s in SOURCES}
+SOURCE_GROUPS = {s["id"]: s.get("group", "mainstream") for s in SOURCES}
 
 
 def source_label(source_id):
@@ -1253,47 +1298,69 @@ def source_label(source_id):
 # (broadest/most-reliable sources first), minus the ISSP-specific
 # language-first routing, since this app lets the user pick sources
 # directly instead of auto-detecting a title's language.
+#
+# "unpaywall" is deliberately NOT in this list - it isn't a title-search
+# source (see lib.query_unpaywall()'s docstring) and is handled as a
+# separate DOI-keyed enrichment step in lookup_one(), never as part of this
+# per-title candidate loop.
 SOURCE_ORDER = [
-    "crossref", "gesis", "openalex", "semantic_scholar", "core", "openaire",
-    "datacite", "dnb", "hal", "cinii", "arxiv", "pubmed",
+    "crossref", "gesis", "openalex", "semantic_scholar", "core", "lens", "openaire", "doaj",
+    "datacite", "dnb", "hal", "cinii", "swisscovery", "libris", "europepmc",
+    "google_books", "arxiv", "pubmed",
 ]
 
-REGIONAL_SOURCE_BY_LANGUAGE = {
-    "de": "dnb",
-    "fr": "hal",
-    "ja": "cinii",
-}
-REGIONAL_SOURCE_IDS = set(REGIONAL_SOURCE_BY_LANGUAGE.values())
-DOI_URL_LOOKUP_CACHE_VERSION = "language-routed-v2"
+# Derived straight from SOURCES so the two stay in sync automatically -
+# see the "restrict_languages" / "restrict_item_type_families" comment on
+# SOURCES above for what these mean.
+REGIONAL_SOURCE_LANGUAGES = {s["id"]: s["restrict_languages"] for s in SOURCES if s.get("restrict_languages")}
+REGIONAL_SOURCE_IDS = set(REGIONAL_SOURCE_LANGUAGES)
+TYPE_RESTRICTED_SOURCES = {s["id"]: s["restrict_item_type_families"] for s in SOURCES if s.get("restrict_item_type_families")}
+DOI_URL_LOOKUP_CACHE_VERSION = "source-expanded-v3"
 ABSTRACT_CACHE_VERSION = "source-first-v1"
 
 
-def ordered_lookup_sources(title, enabled_sources):
+def ordered_lookup_sources(title, enabled_sources, item_type=None):
     """Return the DOI/URL batch route for one title.
 
-    Regional catalogues are mutually exclusive and language-routed, matching
-    the original ``find_doi_url.py`` behaviour: German titles may try DNB,
-    French titles HAL, and Japanese titles CiNii. Other titles do not spend
-    requests on those catalogues. arXiv and PubMed remain the final fallbacks.
+    Regional catalogues (DNB/HAL/CiNii/swisscovery/Libris) are
+    language-routed: each is only tried when the title's detected language
+    is in that source's `restrict_languages`, and any that match are tried
+    FIRST (ahead of the generic chain), since a non-English title is more
+    likely indexed there than in Crossref/OpenAlex. Titles whose language
+    doesn't match a regional source's set spend no requests on it.
+
+    Type-restricted catalogues (currently just Google Books) are only tried
+    when `item_type` is given AND normalizes (via _item_type_family()) to
+    one of that source's `restrict_item_type_families`. With no item_type
+    provided (the default), type-restricted sources are skipped entirely -
+    "don't know the type" defaults to "don't spend the quota", not "try it
+    anyway".
 
     This helper is used only by DOI/URL lookup. Abstract/full-text retrieval
     has its own network and safety controls and is intentionally unaffected.
     """
     enabled_set = set(enabled_sources or [])
     detected_language = lib.detect_title_language(lib.clean_title(str(title or "")))
-    routed_regional = REGIONAL_SOURCE_BY_LANGUAGE.get(detected_language)
+    normalized_type = _item_type_family(item_type) if item_type else ""
 
-    ordered = []
-    if routed_regional and routed_regional in enabled_set:
-        ordered.append(routed_regional)
-    ordered.extend(
+    regional_matches = [
         source_id for source_id in SOURCE_ORDER
-        if source_id in enabled_set and source_id not in REGIONAL_SOURCE_IDS
-    )
+        if source_id in enabled_set and source_id in REGIONAL_SOURCE_IDS
+        and detected_language and detected_language in REGIONAL_SOURCE_LANGUAGES[source_id]
+    ]
+
+    ordered = list(regional_matches)
+    for source_id in SOURCE_ORDER:
+        if source_id in enabled_set and source_id not in regional_matches:
+            if source_id in REGIONAL_SOURCE_IDS:
+                continue  # regional but didn't match this title's language
+            if source_id in TYPE_RESTRICTED_SOURCES and normalized_type not in TYPE_RESTRICTED_SOURCES[source_id]:
+                continue  # type-restricted and this record isn't that type
+            ordered.append(source_id)
     return ordered, detected_language
 
 
-def _call_source(source_id, title, author, email="", s2_api_key=None, core_api_key=None):
+def _call_source(source_id, title, author, email="", s2_api_key=None, core_api_key=None, lens_api_key=None):
     """Returns (candidates, error) - every lib.query_*() does, see
     doi_lookup_lib.py's module docstring."""
     if source_id == "crossref":
@@ -1320,6 +1387,18 @@ def _call_source(source_id, title, author, email="", s2_api_key=None, core_api_k
         return lib.query_hal(title, author)
     if source_id == "cinii":
         return lib.query_cinii(title, author)
+    if source_id == "doaj":
+        return lib.query_doaj(title, author)
+    if source_id == "europepmc":
+        return lib.query_europepmc(title, author)
+    if source_id == "google_books":
+        return lib.query_google_books(title, author)
+    if source_id == "lens":
+        return lib.query_lens(title, author, api_key=lens_api_key)
+    if source_id == "swisscovery":
+        return lib.query_swisscovery(title, author)
+    if source_id == "libris":
+        return lib.query_libris(title, author)
     return [], None
 
 
@@ -1327,19 +1406,29 @@ def _call_source(source_id, title, author, email="", s2_api_key=None, core_api_k
 # Single lookup (queries every enabled source, returns everything ranked)
 # ---------------------------------------------------------------------------
 
-def run_search(title, author, year, enabled_sources, email="", s2_api_key=None, core_api_key=None):
+def run_search(title, author, year, enabled_sources, email="", s2_api_key=None, core_api_key=None, lens_api_key=None):
     """Returns (results, failed_sources). `failed_sources` is a list of
     {"source": id, "error": msg} for any enabled source that errored out
     instead of genuinely responding with zero candidates - an empty
     `results` list paired with a non-empty `failed_sources` means "we
-    don't actually know if there's a match," not "there is no match"."""
+    don't actually know if there's a match," not "there is no match".
+
+    Unlike lookup_one() (used by Batch Import), this is Single Lookup's
+    manual/exploratory search: it queries every enabled source unfiltered,
+    with no language or item-type routing, so a user who deliberately
+    enabled e.g. Google Books or swisscovery for one title always gets an
+    answer from it rather than a silent skip - the quota-saving routing in
+    ordered_lookup_sources() exists for unattended batch runs over
+    thousands of rows, not a single button click."""
     query_title = lib.clean_title(title)
     author_lastnames = [author] if author else []
 
     all_candidates = []
     failed_sources = []
     for source_id in enabled_sources:
-        candidates, error = _call_source(source_id, query_title, author, email, s2_api_key, core_api_key)
+        if source_id == "unpaywall":
+            continue  # DOI-keyed enrichment, not a title-search source - see lib.query_unpaywall()
+        candidates, error = _call_source(source_id, query_title, author, email, s2_api_key, core_api_key, lens_api_key)
         if error:
             failed_sources.append({"source": source_id, "error": error})
         all_candidates += candidates
@@ -1371,7 +1460,7 @@ def _candidate_abstract_text(value):
 
 
 def lookup_abstract_from_sources(title, author, year, doi, url, enabled_sources,
-                                 email="", s2_api_key=None, core_api_key=None):
+                                 email="", s2_api_key=None, core_api_key=None, lens_api_key=None):
     """Find a strongly matched abstract in enabled metadata sources.
 
     Sources are checked in the same user-selected order as DOI/URL lookup.
@@ -1391,7 +1480,7 @@ def lookup_abstract_from_sources(title, author, year, doi, url, enabled_sources,
     for source_id in ordered_sources:
         candidates, error = _call_source(
             source_id, query_title, lib.clean_author(str(author or "")),
-            email, s2_api_key, core_api_key)
+            email, s2_api_key, core_api_key, lens_api_key)
         if error:
             failed_sources.append({"source": source_id, "error": error})
             continue
@@ -1451,44 +1540,102 @@ def lookup_abstract_from_sources(title, author, year, doi, url, enabled_sources,
 # doi_lookup_lib.process_row(), scoped to just the sources the user picked)
 # ---------------------------------------------------------------------------
 
-def lookup_one(title, author_field, year, enabled_sources, email="", s2_api_key=None, core_api_key=None):
+def _enrich_url_via_unpaywall(result, existing_doi, email):
+    """Post-step for lookup_one(): if a DOI is known (either just found by
+    a title-search source above, or already present on the record before
+    this lookup even ran) but the result still has no URL, ask Unpaywall
+    for that DOI's open-access location and fill the URL with it.
+
+    This is the only caller of lib.query_unpaywall() - see its docstring
+    for why Unpaywall can't participate in the normal per-title candidate
+    loop above (it's DOI-keyed, not a title search).
+    """
+    own_doi = normalize_doi(result.get("doi"))
+    doi = own_doi or normalize_doi(existing_doi)
+    if not doi or result.get("url"):
+        return result
+
+    candidates, error = lib.query_unpaywall(doi, email)
+    if error or not candidates:
+        return result
+    oa_url = candidates[0].get("url")
+    if not oa_url:
+        return result
+
+    enriched = dict(result)
+    enriched["url"] = oa_url
+    enriched["doi"] = enriched.get("doi") or doi
+    enriched["source"] = f"{enriched['source']}+unpaywall" if enriched.get("source") else "unpaywall"
+    if not own_doi:
+        # No title-matched candidate contributed a DOI of its own this run
+        # (status not_found/incomplete/low_confidence/matched_no_link) - the
+        # DOI came entirely from the record's own pre-existing value, which
+        # is already trusted, so a leftover "not found"-flavored status
+        # would be actively misleading once a real URL has just been
+        # attached to it.
+        enriched["status"] = "url_enriched"
+    return enriched
+
+
+def lookup_one(title, author_field, year, enabled_sources, email="", s2_api_key=None, core_api_key=None,
+                lens_api_key=None, item_type=None, existing_doi=""):
     """Returns a single result dict, always including a "failed_sources"
     list ({"source": id, "error": msg} for any source that errored out
     instead of genuinely returning zero candidates). When nothing at all
     was found AND at least one enabled source failed, status is
     "incomplete" rather than "not_found" - a clean negative can't be
-    claimed when part of the search never actually completed."""
+    claimed when part of the search never actually completed.
+
+    `item_type` (e.g. "BOOK", "JOUR", "CHAP" - any string _item_type_family()
+    recognizes) restricts type-gated sources like Google Books to records
+    that are actually that type - see ordered_lookup_sources(). Pass "" or
+    None when the type isn't known; type-restricted sources are then simply
+    skipped rather than guessed at.
+
+    `existing_doi`, if given, is the DOI the record already had before this
+    lookup ran. It doesn't affect the title-search candidate loop, but lets
+    the Unpaywall enrichment step (see _enrich_url_via_unpaywall()) fill in
+    a missing URL even when the title search itself finds no new match -
+    the DOI is already trusted, so Unpaywall only needs it, not a title
+    match, to look up an open-access location."""
     query_title = lib.clean_title(str(title or ""))
     if not query_title.strip():
         return {"status": "no_title", "doi": "", "url": "", "matched_title": "", "source": "", "score": 0, "failed_sources": []}
 
     author = lib.clean_author(str(author_field or ""))
     author_lastnames = lib.clean_authors(str(author_field or ""))
+    use_unpaywall = "unpaywall" in (enabled_sources or [])
 
-    ordered_sources, detected_language = ordered_lookup_sources(query_title, enabled_sources)
+    ordered_sources, detected_language = ordered_lookup_sources(query_title, enabled_sources, item_type=item_type)
     all_candidates = []
     failed_sources = []
+    result = None
     for source_id in ordered_sources:
-        candidates, error = _call_source(source_id, query_title, author, email, s2_api_key, core_api_key)
+        candidates, error = _call_source(source_id, query_title, author, email, s2_api_key, core_api_key, lens_api_key)
         if error:
             failed_sources.append({"source": source_id, "error": error})
         all_candidates += candidates
         if all_candidates:
-            result = lib.build_result(query_title, author_lastnames, year, all_candidates, failed_sources)
-            if result["status"] == "auto_accepted":
-                return {**result, "score": result["match_score"],
-                        "detected_lang": detected_language}
+            candidate_result = lib.build_result(query_title, author_lastnames, year, all_candidates, failed_sources)
+            if candidate_result["status"] == "auto_accepted":
+                result = {**candidate_result, "score": candidate_result["match_score"],
+                          "detected_lang": detected_language}
+                break
 
-    if not all_candidates:
-        return {
-            "status": "incomplete" if failed_sources else "not_found",
-            "doi": "", "url": "", "matched_title": "", "source": "", "score": 0,
-            "failed_sources": failed_sources,
-        }
+    if result is None:
+        if not all_candidates:
+            result = {
+                "status": "incomplete" if failed_sources else "not_found",
+                "doi": "", "url": "", "matched_title": "", "source": "", "score": 0,
+                "failed_sources": failed_sources, "detected_lang": detected_language,
+            }
+        else:
+            built = lib.build_result(query_title, author_lastnames, year, all_candidates, failed_sources)
+            result = {**built, "score": built["match_score"], "detected_lang": detected_language}
 
-    result = lib.build_result(query_title, author_lastnames, year, all_candidates, failed_sources)
-    return {**result, "score": result["match_score"],
-            "detected_lang": detected_language}
+    if use_unpaywall:
+        result = _enrich_url_via_unpaywall(result, existing_doi, email)
+    return result
 
 
 def load_cache():
@@ -1506,10 +1653,23 @@ def save_cache(cache):
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
 
-def cache_key(title, author_field, year, enabled_sources):
+def clear_cache():
+    """Wipe the DOI/URL lookup cache (lookup_cache.json) - used by the
+    Batch Import "Clear cached results before running" option, so a run can
+    force every record to be looked up fresh instead of reusing whatever an
+    earlier run (possibly with different sources/settings) already found.
+    Safe to call even if the file doesn't exist yet."""
+    try:
+        os.remove(CACHE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def cache_key(title, author_field, year, enabled_sources, item_type="", existing_doi=""):
     sources_part = ",".join(sorted(enabled_sources))
     return (f"{DOI_URL_LOOKUP_CACHE_VERSION}|||{lib.clean_title(str(title or ''))}|||"
-            f"{lib.clean_author(str(author_field or ''))}|||{year}|||{sources_part}")
+            f"{lib.clean_author(str(author_field or ''))}|||{year}|||{sources_part}|||"
+            f"{item_type or ''}|||{normalize_doi(existing_doi) or ''}")
 
 
 def abstract_cache_key(title, author, year, doi, url, enabled_sources):

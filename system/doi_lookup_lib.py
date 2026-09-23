@@ -2,8 +2,10 @@
 doi_lookup_lib.py
 -------------------
 Shared DOI/URL lookup logic: queries against Crossref, OpenAlex, Semantic
-Scholar, DataCite, GESIS, arXiv, PubMed, CORE, OpenAIRE, DNB, HAL, and
-CiNii, plus title-similarity scoring and the language-first routing chain.
+Scholar, DataCite, GESIS, arXiv, PubMed, CORE, OpenAIRE, DNB, HAL, CiNii,
+DOAJ, Europe PMC, Google Books, Lens.org, swisscovery (Switzerland), Libris
+(Sweden), and Unpaywall, plus title-similarity scoring and the
+language-first routing chain.
 
 This module has no CLI and no cache of its own. It lives with the GUI app in
 the self-contained system folder and is imported by both lookup_core.py and
@@ -37,6 +39,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
 from rapidfuzz import fuzz
@@ -774,6 +777,13 @@ _SOURCE_RATE_LIMITERS = {
     "semantic_scholar": _RateLimiter(3.1), "semantic_scholar_key": _RateLimiter(1.1),
     "core": _RateLimiter(1.5), "openaire": _RateLimiter(0.75),
     "dnb": _RateLimiter(0.75), "hal": _RateLimiter(0.75), "cinii": _RateLimiter(0.75),
+    # Added for the 2026 source expansion (Unpaywall/DOAJ/Europe PMC/Google
+    # Books/Lens.org/swisscovery/Libris) - see query_*() docstrings below for
+    # what each source is and why its interval was picked.
+    "unpaywall": _RateLimiter(0.2), "doaj": _RateLimiter(0.5),
+    "europepmc": _RateLimiter(0.35), "google_books": _RateLimiter(1.0),
+    "lens": _RateLimiter(1.0), "swisscovery": _RateLimiter(0.75),
+    "libris": _RateLimiter(0.75),
 }
 
 
@@ -793,14 +803,20 @@ def _retry_after_seconds(response, attempt: int) -> float:
     return min(60.0, (2 ** attempt) * 3.0 + random.uniform(0.2, 1.0))
 
 
-def _get_with_retry(source_id: str, url: str, *, max_attempts: int = 4, **kwargs):
-    """Rate-limited GET with shared 429 cooldown and bounded backoff."""
+def _get_with_retry(source_id: str, url: str, *, method: str = "GET", max_attempts: int = 4, **kwargs):
+    """Rate-limited GET (or, with method="POST", POST - needed by
+    query_lens(), the one source whose API is POST-only) with shared 429
+    cooldown and bounded backoff."""
     limiter = _SOURCE_RATE_LIMITERS[source_id]
     last_response = None
     for attempt in range(max_attempts):
         limiter.wait()
         try:
-            response = requests.get(url, **kwargs)
+            # GET goes through requests.get() specifically (not the generic
+            # requests.request()) so existing tests that patch
+            # requests.get() keep working unchanged; only query_lens()'s
+            # POST needs the generic path.
+            response = requests.get(url, **kwargs) if method == "GET" else requests.request(method, url, **kwargs)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             if attempt == max_attempts - 1:
                 raise
@@ -1101,13 +1117,13 @@ def query_dnb(title: str, author: str, rows: int = 5):
         if record_data is None:
             continue
 
-        title_els = record_data.findall("dc:title", ns)
+        title_els = record_data.findall(".//dc:title", ns)
         cand_title = title_els[0].text.strip() if title_els and title_els[0].text else ""
         if not cand_title:
             continue
 
         authors = []
-        for creator_el in record_data.findall("dc:creator", ns):
+        for creator_el in record_data.findall(".//dc:creator", ns):
             name = (creator_el.text or "").strip()
             if not name:
                 continue
@@ -1116,7 +1132,7 @@ def query_dnb(title: str, author: str, rows: int = 5):
             else:
                 authors.append(name.split()[-1])
 
-        date_els = record_data.findall("dc:date", ns)
+        date_els = record_data.findall(".//dc:date", ns)
         year = None
         for date_el in date_els:
             if date_el.text:
@@ -1127,7 +1143,8 @@ def query_dnb(title: str, author: str, rows: int = 5):
 
         doi = None
         catalog_url = None
-        for id_el in record_data.findall("dc:identifier", ns):
+        dnb_idn = None
+        for id_el in record_data.findall(".//dc:identifier", ns):
             value = (id_el.text or "").strip()
             if not value:
                 continue
@@ -1135,11 +1152,19 @@ def query_dnb(title: str, author: str, rows: int = 5):
                 doi = value.split("doi.org/")[-1]
             elif value.startswith("http"):
                 catalog_url = value
+            elif re.fullmatch(r"\d{6,}", value):
+                # DNB's own record number (IDN) - present even on minimal
+                # records (e.g. print-only books) that carry no http
+                # identifier at all, and resolves to a real catalog page at
+                # d-nb.info/<idn> (verified live) - the last-resort link.
+                dnb_idn = value
 
         if doi:
             link = f"https://doi.org/{doi}"
         elif catalog_url:
             link = catalog_url
+        elif dnb_idn:
+            link = f"https://d-nb.info/{dnb_idn}"
         else:
             link = None
 
@@ -1152,7 +1177,7 @@ def query_dnb(title: str, author: str, rows: int = 5):
             "year": year,
             "abstract": " ".join(
                 (element.text or "").strip()
-                for element in record_data.findall("dc:description", ns)
+                for element in record_data.findall(".//dc:description", ns)
                 if (element.text or "").strip()
             ),
         })
@@ -1275,6 +1300,467 @@ def query_cinii(title: str, author: str, rows: int = 5):
             "abstract": it.get("dc:description") or it.get("description") or "",
         })
     return candidates, None
+
+
+def query_swisscovery(title: str, author: str, rows: int = 5):
+    """
+    Query swisscovery, the shared Alma-based catalog of the Swiss library
+    network (SLSP) - the regional first-choice source for German/French/
+    Italian-language Swiss titles. Free, keyless SRU (Dublin Core), same
+    protocol/shape as query_dnb() above, just a different endpoint/database.
+
+    LINK NOTE: swisscovery's dc:identifier values are internal catalog IDs
+    (swissbib/IDSBB numbers), never a DOI or a usable URL, so the link
+    returned is a constructed Alma permalink
+    (https://swisscovery.slsp.ch/discovery/fulldisplay?docid=alma<mms_id>...)
+    built from the record's own <recordIdentifier> (its Alma MMS ID) -
+    verified to resolve to the real catalog page, so it's treated as a
+    genuine link, not url_is_reference_only.
+
+    Returns (candidates, error) - see the module docstring.
+    """
+    url = "https://swisscovery.slsp.ch/view/sru/41SLSP_NETWORK"
+    cql_parts = [f'alma.title="{title}"']
+    if author:
+        cql_parts.append(f'alma.creator="{author}"')
+    params = {
+        "version": "1.2",
+        "operation": "searchRetrieve",
+        "query": " and ".join(cql_parts),
+        "recordSchema": "dc",
+        "maximumRecords": rows,
+    }
+    try:
+        r = _get_with_retry("swisscovery", url, params=params, timeout=15)
+        r.raise_for_status()
+        ns = {"srw": "http://www.loc.gov/zing/srw/", "dc": "http://purl.org/dc/elements/1.1/"}
+        root = ET.fromstring(r.text)
+        records = root.findall(".//srw:record", ns)
+    except Exception as e:
+        return [], _describe_exception(e)
+
+    candidates = []
+    for rec in records:
+        record_data = rec.find("srw:recordData", ns)
+        if record_data is None:
+            continue
+
+        title_els = record_data.findall(".//dc:title", ns)
+        cand_title = title_els[0].text.strip() if title_els and title_els[0].text else ""
+        if not cand_title:
+            continue
+
+        authors = []
+        for creator_el in record_data.findall(".//dc:creator", ns):
+            name = (creator_el.text or "").strip()
+            if not name:
+                continue
+            authors.append(name.split(",")[0].strip() if "," in name else name.split()[-1])
+
+        year = None
+        for date_el in record_data.findall(".//dc:date", ns):
+            if date_el.text:
+                m = re.search(r"\d{4}", date_el.text)
+                if m:
+                    year = int(m.group())
+                    break
+
+        doi = None
+        for id_el in record_data.findall(".//dc:identifier", ns):
+            value = (id_el.text or "").strip()
+            if value.lower().startswith("10.") or "doi.org/" in value.lower():
+                doi = value.split("doi.org/")[-1]
+                break
+
+        record_id_el = rec.find("srw:recordIdentifier", ns)
+        mms_id = (record_id_el.text or "").strip() if record_id_el is not None and record_id_el.text else ""
+        if doi:
+            link = f"https://doi.org/{doi}"
+        elif mms_id:
+            link = (f"https://swisscovery.slsp.ch/discovery/fulldisplay?docid=alma{mms_id}"
+                    f"&context=L&vid=41SLSP_NETWORK:VU1_UNION&lang=en")
+        else:
+            link = None
+
+        candidates.append({
+            "source": "swisscovery",
+            "title": cand_title,
+            "doi": doi,
+            "url": link,
+            "authors": authors,
+            "year": year,
+            "abstract": " ".join(
+                (el.text or "").strip()
+                for el in record_data.findall(".//dc:description", ns)
+                if (el.text or "").strip()),
+        })
+    return candidates, None
+
+
+def query_libris(title: str, author: str, rows: int = 5):
+    """
+    Query Libris XSearch, the National Library of Sweden's union catalog -
+    the regional first-choice source for Swedish-language titles. Free,
+    keyless JSON API.
+
+    LINK NOTE: like DNB, Libris catalog records almost never carry a DOI -
+    the "identifier" field is a permanent libris.kb.se catalog page, treated
+    as a genuine usable link, not url_is_reference_only.
+
+    Returns (candidates, error) - see the module docstring.
+    """
+    query_parts = [f"tit:({title})"]
+    if author:
+        query_parts.append(f"förf:({author})")
+    params = {"query": " and ".join(query_parts), "format": "json", "n": rows}
+    try:
+        r = _get_with_retry("libris", "https://libris.kb.se/xsearch", params=params, timeout=15)
+        r.raise_for_status()
+        items = r.json().get("xsearch", {}).get("list", [])
+    except Exception as e:
+        return [], _describe_exception(e)
+
+    candidates = []
+    for item in items:
+        cand_title = item.get("title") or ""
+        if not cand_title:
+            continue
+
+        creator = item.get("creator") or ""
+        authors = []
+        if creator:
+            name = creator.split(",")[0].strip() if "," in creator else creator.split()[-1]
+            if name:
+                authors.append(name)
+
+        date_value = item.get("date")
+        if isinstance(date_value, list):
+            date_value = date_value[0] if date_value else ""
+        year_match = re.search(r"\d{4}", str(date_value or ""))
+        year = int(year_match.group()) if year_match else None
+
+        candidates.append({
+            "source": "libris",
+            "title": cand_title,
+            "doi": None,
+            "url": item.get("identifier") or None,
+            "authors": authors,
+            "year": year,
+            "abstract": "",
+        })
+    return candidates, None
+
+
+def query_doaj(title: str, author: str, rows: int = 5):
+    """
+    Query DOAJ (Directory of Open Access Journals) article search - a
+    general-purpose, cross-discipline index of open-access journal articles.
+    Free, keyless. DOAJ enforces its own ~2 requests/second limit
+    independently of this module's rate limiter, see _SOURCE_RATE_LIMITERS.
+
+    Returns (candidates, error) - see the module docstring.
+    """
+    query_parts = [f'bibjson.title:"{title}"']
+    if author:
+        query_parts.append(f'bibjson.author.name:"{author}"')
+    query_text = " AND ".join(query_parts)
+    url = f"https://doaj.org/api/search/articles/{quote(query_text, safe='')}"
+    try:
+        r = _get_with_retry("doaj", url, params={"pageSize": rows}, timeout=15)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+    except Exception as e:
+        return [], _describe_exception(e)
+
+    candidates = []
+    for item in results:
+        bibjson = item.get("bibjson") or {}
+        cand_title = bibjson.get("title") or ""
+        if not cand_title:
+            continue
+
+        authors = []
+        for a in bibjson.get("author") or []:
+            name = (a.get("name") or "").strip()
+            if name:
+                authors.append(name.split()[-1])
+
+        doi = None
+        for identifier in bibjson.get("identifier") or []:
+            if (identifier.get("type") or "").lower() == "doi":
+                doi = identifier.get("id")
+                break
+
+        link = None
+        for l in bibjson.get("link") or []:
+            if l.get("url"):
+                link = l["url"]
+                break
+        if doi:
+            link = f"https://doi.org/{doi}"
+
+        candidates.append({
+            "source": "doaj",
+            "title": cand_title,
+            "doi": doi,
+            "url": link,
+            "authors": authors,
+            "year": bibjson.get("year"),
+            "abstract": bibjson.get("abstract") or "",
+        })
+    return candidates, None
+
+
+def query_europepmc(title: str, author: str, rows: int = 5):
+    """
+    Query Europe PMC's REST search API - broad life-science / biomedical /
+    public-health literature. Overlaps query_pubmed() but also indexes
+    preprints and journals PubMed/MEDLINE doesn't cover. Free, keyless.
+
+    `resultType=core` is required to get abstractText/fullTextUrlList back -
+    the default "lite" result type silently omits both.
+
+    Returns (candidates, error) - see the module docstring.
+    """
+    query_parts = [f'TITLE:"{title}"']
+    if author:
+        query_parts.append(f'AUTH:"{author}"')
+    url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+    params = {"query": " AND ".join(query_parts), "format": "json",
+              "resultType": "core", "pageSize": rows}
+    try:
+        r = _get_with_retry("europepmc", url, params=params, timeout=15)
+        r.raise_for_status()
+        results = r.json().get("resultList", {}).get("result", [])
+    except Exception as e:
+        return [], _describe_exception(e)
+
+    candidates = []
+    for item in results:
+        cand_title = item.get("title") or ""
+        if not cand_title:
+            continue
+
+        authors = []
+        for a in (item.get("authorList") or {}).get("author") or []:
+            name = (a.get("lastName") or a.get("fullName") or "").strip()
+            if name:
+                authors.append(name)
+
+        doi = item.get("doi")
+        link = f"https://doi.org/{doi}" if doi else None
+        if not link:
+            for full_text in (item.get("fullTextUrlList") or {}).get("fullTextUrl") or []:
+                if full_text.get("url"):
+                    link = full_text["url"]
+                    break
+
+        year = None
+        pub_year = item.get("pubYear")
+        if pub_year:
+            try:
+                year = int(pub_year)
+            except (TypeError, ValueError):
+                pass
+
+        candidates.append({
+            "source": "europepmc",
+            "title": cand_title,
+            "doi": doi,
+            "url": link,
+            "authors": authors,
+            "year": year,
+            "abstract": item.get("abstractText") or "",
+        })
+    return candidates, None
+
+
+def query_google_books(title: str, author: str, rows: int = 5, api_key: str = None):
+    """
+    Query the Google Books volumes API - useful for BOOK/CHAP records that
+    Crossref/OpenAlex/DataCite often miss (this app only ever calls it for
+    those item types - see lookup_core.TYPE_RESTRICTED_SOURCES). Free; works
+    without a key (unreliable/aggressively throttled by Google without
+    notice), or with a free self-service Google Cloud API key for a
+    steadier quota.
+
+    LINK NOTE: books rarely carry a DOI - the link returned is Google's own
+    book info/preview page, a genuine document reference (same trade-off as
+    DNB's catalog-page fallback), not url_is_reference_only.
+
+    Returns (candidates, error) - see the module docstring.
+    """
+    query_parts = [f'intitle:"{title}"']
+    if author:
+        query_parts.append(f'inauthor:"{author}"')
+    params = {"q": " ".join(query_parts), "maxResults": rows}
+    if api_key:
+        params["key"] = api_key
+    url = "https://www.googleapis.com/books/v1/volumes"
+    try:
+        r = _get_with_retry("google_books", url, params=params, timeout=15)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+    except Exception as e:
+        return [], _describe_exception(e)
+
+    candidates = []
+    for item in items:
+        info = item.get("volumeInfo") or {}
+        cand_title = info.get("title") or ""
+        if not cand_title:
+            continue
+        subtitle = info.get("subtitle")
+        if subtitle:
+            cand_title = f"{cand_title}: {subtitle}"
+
+        authors = [name.split()[-1] for name in info.get("authors") or [] if name]
+
+        year = None
+        year_match = re.search(r"\d{4}", info.get("publishedDate") or "")
+        if year_match:
+            year = int(year_match.group())
+
+        candidates.append({
+            "source": "google_books",
+            "title": cand_title,
+            "doi": None,
+            "url": info.get("canonicalVolumeLink") or info.get("infoLink"),
+            "authors": authors,
+            "year": year,
+            "abstract": info.get("description") or "",
+        })
+    return candidates, None
+
+
+def query_lens(title: str, author: str, rows: int = 5, api_key: str = None):
+    """
+    Query the Lens.org Scholarly API. REQUIRES an API token - unlike
+    Crossref/OpenAlex, Lens has no keyless tier at all, and even its free
+    academic trial requires signing in at lens.org and requesting a token
+    (an approval step, not instant self-service - see the Sources tab note).
+    If `api_key` is None, this function returns ([], None) immediately
+    WITHOUT making any network request - a deliberate skip, not a failure,
+    same pattern as query_core().
+
+    Returns (candidates, error) - see the module docstring.
+    """
+    if not api_key:
+        return [], None
+
+    url = "https://api.lens.org/scholarly/search"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "query": f"{title} {author}".strip(),
+        "size": rows,
+        "include": ["title", "authors", "external_ids", "year_published", "abstract",
+                    "source_urls", "open_access"],
+    }
+    try:
+        r = _get_with_retry("lens", url, method="POST", json=body, headers=headers, timeout=20)
+        r.raise_for_status()
+        items = r.json().get("data", [])
+    except Exception as e:
+        return [], _describe_exception(e)
+
+    candidates = []
+    for item in items:
+        cand_title = item.get("title") or ""
+        if not cand_title:
+            continue
+
+        authors = []
+        for a in item.get("authors") or []:
+            last = (a.get("last_name") or "").strip()
+            if last:
+                authors.append(last)
+
+        doi = None
+        for ext_id in item.get("external_ids") or []:
+            if (ext_id.get("type") or "").lower() == "doi":
+                doi = ext_id.get("value")
+                break
+
+        link = f"https://doi.org/{doi}" if doi else None
+        if not link:
+            for source_url in item.get("source_urls") or []:
+                if source_url.get("url"):
+                    link = source_url["url"]
+                    break
+        if not link:
+            for location in (item.get("open_access") or {}).get("locations") or []:
+                for candidate_url in (location.get("landing_page_urls") or []) + (location.get("pdf_urls") or []):
+                    if candidate_url:
+                        link = candidate_url
+                        break
+                if link:
+                    break
+
+        candidates.append({
+            "source": "lens",
+            "title": cand_title,
+            "doi": doi,
+            "url": link,
+            "authors": authors,
+            "year": item.get("year_published"),
+            "abstract": item.get("abstract") or "",
+        })
+    return candidates, None
+
+
+def query_unpaywall(doi: str, email: str = ""):
+    """
+    Query Unpaywall for the open-access location of an ALREADY-KNOWN DOI.
+    Free, keyless - just a free-text `email` query param (a "polite pool"
+    identifier, not a registration).
+
+    UNLIKE every other query_*() in this module, this is NOT a title-search
+    function - Unpaywall has no search endpoint, only a per-DOI lookup. It
+    exists purely to fill in a missing URL for a record whose DOI is
+    already known (supplied by the caller, or found by another source
+    earlier in the same lookup) - see lookup_core.lookup_one()'s Unpaywall
+    enrichment step, which is the only caller of this function. It is
+    deliberately excluded from SOURCE_ORDER/ordered_lookup_sources() so it
+    never gets called as part of the normal per-title candidate loop.
+
+    Returns (candidates, error): a single-item list on success (there's
+    only ever one real "candidate" - the DOI itself), for consistency with
+    what every other query_*() caller expects.
+    """
+    doi = (doi or "").strip()
+    if not doi:
+        return [], None
+    contact = (email or "").strip() or "unpaywall@example.org"
+    url = f"https://api.unpaywall.org/v2/{quote(doi, safe='')}"
+    try:
+        r = _get_with_retry("unpaywall", url, params={"email": contact}, timeout=15)
+        if r.status_code == 404:
+            return [], None  # DOI not in Unpaywall's index - a genuine negative, not a failure
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return [], _describe_exception(e)
+
+    best = data.get("best_oa_location") or {}
+    best_url = best.get("url") or best.get("url_for_pdf") or best.get("url_for_landing_page")
+    if not best_url:
+        return [], None
+
+    authors = []
+    for a in data.get("z_authors") or []:
+        name = (a.get("raw_author_name") or "").strip()
+        if name:
+            authors.append(name.split()[-1])
+
+    return [{
+        "source": "unpaywall",
+        "title": data.get("title") or "",
+        "doi": doi,
+        "url": best_url,
+        "authors": authors,
+        "year": data.get("year"),
+        "abstract": "",
+    }], None
 
 
 def _author_bonus(target_author_lastnames: list, cand_authors: list):
