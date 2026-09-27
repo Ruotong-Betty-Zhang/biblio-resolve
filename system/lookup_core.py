@@ -1935,12 +1935,13 @@ def _text_encoding_candidates(path):
     return ["utf-8-sig", "cp1252", "latin-1"]
 
 
-def _read_delimited_file(path):
+def _read_delimited_file(path, as_text=False):
     """Read an unknown CSV/text export without silently dropping characters."""
     failures = []
+    text_options = {"dtype": str, "keep_default_na": False} if as_text else {}
     for encoding in _text_encoding_candidates(path):
         try:
-            df = pd.read_csv(path, encoding=encoding, sep=None, engine="python")
+            df = pd.read_csv(path, encoding=encoding, sep=None, engine="python", **text_options)
             df.attrs["source_encoding"] = encoding
             return df
         except (UnicodeError, pd.errors.ParserError) as exc:
@@ -1959,10 +1960,12 @@ def _read_json_file(path):
     raise ValueError("Unable to decode this JSON file. Tried: " + "; ".join(failures))
 
 
-def read_records_file(path: str) -> pd.DataFrame:
+def read_records_file(path: str, as_text: bool = False) -> pd.DataFrame:
+    """Load a bibliography file. ``as_text`` keeps every CSV cell as the
+    literal string (no ``12`` -> ``12.0`` or blank -> NaN inference)."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
-        df = _read_delimited_file(path)
+        df = _read_delimited_file(path, as_text=as_text)
     elif ext in (".xlsx", ".xls"):
         df = pd.read_excel(path)
     elif ext == ".json":
@@ -2191,7 +2194,15 @@ def _read_ris(path):
             elif tag in {"JO", "JF", "T2"}: current.setdefault("Publication Title", value)
             elif tag == "DO": current["DOI"] = value
             elif tag in {"UR", "L1"}: current.setdefault("Url", value)
-            elif tag == "SN": current.setdefault("ISSN", value)
+            elif tag == "SN":
+                # RIS uses SN for both; an ISBN has 10/13 characters, an ISSN 8.
+                digits = re.sub(r"[^0-9Xx]", "", value)
+                current.setdefault("ISBN" if len(digits) in {10, 13} else "ISSN", value)
+            elif tag == "VL": current.setdefault("Volume", value)
+            elif tag == "IS": current.setdefault("Issue", value)
+            elif tag == "SP": current["Pages"] = "-".join(filter(None, [value, current.get("Pages")]))
+            elif tag == "EP": current["Pages"] = "-".join(filter(None, [current.get("Pages"), value]))
+            elif tag == "PB": current.setdefault("Publisher", value)
             elif tag == "KW": current["Keywords"] = "; ".join(
                 filter(None, [current.get("Keywords"), value]))
             elif tag in {"N1", "RN"}: current["Notes"] = "\n".join(
@@ -2213,9 +2224,19 @@ def _write_ris(df, path, portable_columns=None):
             for tag, value in [("TI", _value(row, "Title", "Matched Title")),
                                ("PY", _value(row, "Publication Year", "Year")),
                                ("JO", _value(row, "Publication Title", "Journal")),
+                               ("VL", _value(row, "Volume")),
+                               ("IS", _value(row, "Issue", "Number")),
+                               ("PB", _value(row, "Publisher")),
+                               ("SN", _value(row, "ISBN")),
+                               ("SN", _value(row, "ISSN")),
                                ("DO", _value(row, "DOI", "doi")),
                                ("UR", _value(row, "Link", "Url", "URL", "url"))]:
                 if value: f.write(f"{tag}  - {value}\n")
+            pages = re.split(r"\s*[-–]+\s*", _value(row, "Pages"), maxsplit=1)
+            if pages[0]:
+                f.write(f"SP  - {pages[0]}\n")
+                if len(pages) > 1 and pages[1]:
+                    f.write(f"EP  - {pages[1]}\n")
             for author in _split_authors(_value(row, "Author", "Authors")):
                 f.write(f"AU  - {author}\n")
             tags, _separator = split_tags(_value(row, "Tags", "Tag", "Keywords", "Keyword"))
@@ -2319,6 +2340,9 @@ def _read_bibtex(path):
             "Publication Year": fields.get("year", ""),
             "Publication Title": fields.get("journal") or fields.get("booktitle", ""),
             "DOI": fields.get("doi", ""), "Url": fields.get("url", ""),
+            "Volume": fields.get("volume", ""), "Issue": fields.get("number", ""),
+            "Pages": re.sub(r"-{2,}", "-", fields.get("pages", "")),
+            "Publisher": fields.get("publisher", ""),
             "ISBN": fields.get("isbn", ""), "ISSN": fields.get("issn", ""),
             "Notes": fields.get("note", ""),
             "Abstract Note": fields.get("abstract", ""),
@@ -2342,6 +2366,10 @@ def _write_bibtex(df, path, portable_columns=None):
                       ("author", " and ".join(_split_authors(_value(row, "Author", "Authors")))),
                       ("year", _value(row, "Publication Year", "Year")),
                       ("journal", _value(row, "Publication Title", "Journal")),
+                      ("volume", _value(row, "Volume")),
+                      ("number", _value(row, "Issue", "Number")),
+                      ("pages", re.sub(r"\s*[-–]+\s*", "--", _value(row, "Pages"))),
+                      ("publisher", _value(row, "Publisher")),
                       ("doi", _value(row, "DOI", "doi")),
                       ("url", _value(row, "Link", "Url", "URL", "url")),
                       ("isbn", _value(row, "ISBN")), ("issn", _value(row, "ISSN")),

@@ -48,6 +48,7 @@ from matplotlib.figure import Figure
 try:  # Package import: import system.literature_lookup
     from . import abstract_note_tools as abstract_tools
     from . import compare_tools
+    from . import convert_tools
     from . import issp_module_tags as issp_tags
     from . import lookup_core as core
     from . import stats_tools
@@ -55,6 +56,7 @@ try:  # Package import: import system.literature_lookup
 except ImportError:  # Direct launch: python literature_lookup.py from system/
     import abstract_note_tools as abstract_tools
     import compare_tools
+    import convert_tools
     import issp_module_tags as issp_tags
     import lookup_core as core
     import stats_tools
@@ -4638,6 +4640,301 @@ class TranslatePage(ctk.CTkFrame):
     def on_export(self):
         if self.output_df is not None:
             _save_enriched_dataframe(self, self.output_df, self.file_path, "translated")
+
+
+# ---------------------------------------------------------------------------
+# File converter: CSV / RIS / BibTeX with column selection and row filters
+# ---------------------------------------------------------------------------
+
+class FileConverterPage(ctk.CTkFrame):
+    """Convert between CSV, RIS and BibTeX, keeping chosen columns and rows."""
+    PREVIEW_ROWS = 200
+    FILTER_HINT = ("No filters — every record is converted. Choose a condition and click Apply; "
+                   "use 'Add another' to combine several with AND or OR.")
+
+    def __init__(self, master):
+        super().__init__(master, fg_color="transparent")
+        self.df = None
+        self.file_path = None
+        self.column_vars = {}
+        self.filter_conditions = []
+        self.table = None
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=4, pady=(6, 8))
+        ctk.CTkButton(top, text="Choose file…", width=130, command=self.on_choose_file).pack(side="left")
+        self.file_label = ctk.CTkLabel(
+            top, text="Choose a CSV, RIS, or BibTeX file to convert — this page does not call any API",
+            anchor="w")
+        self.file_label.pack(side="left", padx=12, fill="x", expand=True)
+        self.convert_btn = ctk.CTkButton(top, text="Convert & save…", width=150,
+                                         command=self.on_convert, state="disabled")
+        self.convert_btn.pack(side="right")
+        self.format_menu = ctk.CTkOptionMenu(
+            top, values=list(convert_tools.CONVERT_FORMATS), width=150,
+            command=lambda _v: self._update_summary())
+        self.format_menu.set("RIS (.ris)")
+        self.format_menu.pack(side="right", padx=(0, 8))
+        ctk.CTkLabel(top, text="Convert to").pack(side="right", padx=(0, 6))
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=4)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        sidebar = ctk.CTkFrame(body, width=225)
+        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        sidebar.grid_propagate(False)
+        ctk.CTkLabel(sidebar, text="Columns to keep", font=ctk.CTkFont(weight="bold")) \
+            .pack(anchor="w", padx=10, pady=(10, 4))
+        buttons = ctk.CTkFrame(sidebar, fg_color="transparent")
+        buttons.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkButton(buttons, text="All", width=95, command=lambda: self._set_all_columns(True)) \
+            .pack(side="left", padx=(0, 4))
+        ctk.CTkButton(buttons, text="None", width=95, command=lambda: self._set_all_columns(False)) \
+            .pack(side="left")
+        self.column_box = ctk.CTkScrollableFrame(sidebar)
+        self.column_box.pack(fill="both", expand=True, padx=6, pady=(0, 10))
+
+        main = ctk.CTkFrame(body, fg_color="transparent")
+        main.grid(row=0, column=1, sticky="nsew")
+        filters = ctk.CTkFrame(main)
+        filters.pack(fill="x", pady=(0, 7))
+        ctk.CTkLabel(filters, text="Filter records", font=ctk.CTkFont(weight="bold")) \
+            .grid(row=0, column=0, sticky="w", padx=10, pady=(7, 2))
+        ctk.CTkLabel(filters, text="Combine conditions with").grid(
+            row=0, column=1, columnspan=2, sticky="e", padx=(0, 6), pady=(7, 2))
+        self.filter_mode = ctk.CTkSegmentedButton(filters, values=["AND", "OR"], width=120)
+        self.filter_mode.set("AND")
+        self.filter_mode.grid(row=0, column=3, columnspan=2, sticky="w", padx=5, pady=(7, 2))
+        self.filter_column = _make_searchable_combobox(
+            filters, values=[NO_COLUMN], command=self._on_filter_column_change, width=210)
+        self.filter_column.grid(row=1, column=0, padx=(10, 5), pady=(0, 7))
+        self.filter_operator = ctk.CTkOptionMenu(
+            filters, values=convert_tools.TEXT_OPERATORS, width=140)
+        self.filter_operator.grid(row=1, column=1, padx=5, pady=(0, 7))
+        self.filter_value = _make_searchable_combobox(filters, values=[""], width=260, dropdown_rows=9)
+        self.filter_value.grid(row=1, column=2, padx=5, pady=(0, 7), sticky="w")
+        self.filter_value_to = ctk.CTkEntry(filters, width=105, placeholder_text="Upper value")
+        self.filter_value_to.grid(row=1, column=3, padx=5, pady=(0, 7))
+        ctk.CTkButton(filters, text="Add another", width=110, command=self.add_filter_condition) \
+            .grid(row=1, column=4, padx=5, pady=(0, 7))
+        ctk.CTkButton(filters, text="Apply", width=70, command=self.apply_filters) \
+            .grid(row=1, column=5, padx=5, pady=(0, 7))
+        ctk.CTkButton(filters, text="Clear", width=65, command=self.clear_filters) \
+            .grid(row=1, column=6, padx=(5, 10), pady=(0, 7))
+        self.filter_summary_box = ctk.CTkTextbox(
+            filters, height=52, wrap="word", activate_scrollbars=True,
+            font=ctk.CTkFont(size=12), text_color=("gray30", "gray70"))
+        self.filter_summary_box.grid(row=2, column=0, columnspan=8, sticky="ew", padx=10, pady=(0, 7))
+        _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
+        filters.grid_columnconfigure(7, weight=1)
+
+        self.summary_label = ctk.CTkLabel(main, text="Choose a file to begin", anchor="w",
+                                          text_color=("gray30", "gray70"))
+        self.summary_label.pack(fill="x", pady=(0, 5))
+        self.table_holder = ctk.CTkFrame(main, fg_color="transparent")
+        self.table_holder.pack(fill="both", expand=True, pady=(0, 6))
+
+    def on_choose_file(self):
+        path = filedialog.askopenfilename(
+            title="Choose a file to convert",
+            filetypes=[("Supported files", "*.csv *.ris *.bib *.bibtex"),
+                       ("CSV", "*.csv"), ("RIS", "*.ris"), ("BibTeX", "*.bib *.bibtex"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        if os.path.splitext(path)[1].lower() not in convert_tools.INPUT_EXTENSIONS:
+            messagebox.showwarning("Unsupported file", "Choose a .csv, .ris, or .bib file.")
+            return
+        try:
+            df = core.read_records_file(path, as_text=True).reset_index(drop=True)
+        except Exception as exc:
+            messagebox.showerror("Couldn't read file", f"Failed to read this file:\n{exc}")
+            return
+        if df.empty:
+            messagebox.showwarning("Empty file", "No records were found in this file.")
+            return
+        # Drop columns that are empty in every record (e.g. unused BibTeX fields).
+        df = df.fillna("")
+        df = df[[c for c in df.columns if df[c].astype(str).str.strip().ne("").any()]]
+        self.df, self.file_path = df, path
+        self.filter_conditions = []
+        self.filter_mode.set("AND")
+        encoding = df.attrs.get("source_encoding")
+        self.file_label.configure(
+            text=f"{os.path.basename(path)} ({len(df):,} records, {len(df.columns)} columns)"
+                 + (f" · {encoding}" if encoding else ""))
+        source_label = core.preferred_output_format_label(path)
+        other = [label for label, (_fmt, ext) in convert_tools.CONVERT_FORMATS.items()
+                 if not source_label.endswith(f"({ext})")]
+        self.format_menu.set(other[0])
+        self.convert_btn.configure(state="normal")
+        self._build_column_choices()
+        _update_combobox_values(self.filter_column, list(df.columns))
+        self.filter_column.set(str(df.columns[0]))
+        self._on_filter_column_change(str(df.columns[0]))
+        _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
+        self.render_preview()
+
+    def _build_column_choices(self):
+        for child in self.column_box.winfo_children():
+            child.destroy()
+        self.column_vars = {}
+        for column in self.df.columns:
+            var = ctk.BooleanVar(value=True)
+            self.column_vars[column] = var
+            ctk.CTkCheckBox(self.column_box, text=str(column), variable=var,
+                            command=self.render_preview).pack(anchor="w", padx=4, pady=3)
+
+    def _set_all_columns(self, selected):
+        for var in self.column_vars.values():
+            var.set(selected)
+        self.render_preview()
+
+    def selected_columns(self):
+        return [column for column, var in self.column_vars.items() if var.get()]
+
+    def _on_filter_column_change(self, column):
+        if self.df is None or column not in self.df.columns:
+            return
+        if convert_tools.is_numeric_column(self.df[column]):
+            self.filter_operator.configure(values=convert_tools.NUMERIC_OPERATORS)
+            self.filter_operator.set(">=")
+            _update_combobox_values(self.filter_value, [])
+            self.filter_value.set("")
+        else:
+            self.filter_operator.configure(values=convert_tools.TEXT_OPERATORS)
+            self.filter_operator.set("equals")
+            values = sorted({str(v).strip() for v in self.df[column] if str(v).strip()}, key=str.casefold)
+            _update_combobox_values(self.filter_value, values[:500] or [""])
+            self.filter_value.set(values[0] if values and len(values) <= 100 else "")
+
+    def _current_filter_condition(self):
+        if self.df is None:
+            messagebox.showinfo("Choose a file", "Load a file before creating filters.")
+            return None
+        column, operator = self.filter_column.get(), self.filter_operator.get()
+        value, upper = self.filter_value.get().strip(), self.filter_value_to.get().strip()
+        if column not in self.df.columns:
+            messagebox.showwarning("Choose a column", "Pick a column to filter on.")
+            return None
+        if operator not in convert_tools.NO_VALUE_OPERATORS and not value:
+            messagebox.showwarning("Missing filter value", "Enter or select a filter value.")
+            return None
+        if operator == "between" and not upper:
+            messagebox.showwarning("Missing upper value", "Enter both values for a between filter.")
+            return None
+        return column, operator, value, upper
+
+    def add_filter_condition(self):
+        condition = self._current_filter_condition()
+        if condition is None:
+            return
+        if condition not in self.filter_conditions:
+            self.filter_conditions.append(condition)
+        self._show_filter_summary(pending=True)
+
+    def apply_filters(self):
+        condition = self._current_filter_condition()
+        if condition is None:
+            return
+        if condition not in self.filter_conditions:
+            self.filter_conditions.append(condition)
+        try:
+            convert_tools.filter_dataframe(self.df, self.filter_conditions, self.filter_mode.get())
+        except (ValueError, KeyError) as exc:
+            self.filter_conditions.remove(condition)
+            messagebox.showerror("Invalid filter", f"The filter could not be applied:\n{exc}")
+            return
+        self.render_preview()
+
+    def clear_filters(self):
+        if self.df is None:
+            return
+        self.filter_conditions = []
+        _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
+        self.render_preview()
+
+    def _filtered(self):
+        return convert_tools.filter_dataframe(self.df, self.filter_conditions, self.filter_mode.get())
+
+    def _show_filter_summary(self, pending=False, matched=None):
+        if not self.filter_conditions:
+            _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
+            return
+        parts = []
+        for column, operator, value, upper in self.filter_conditions:
+            expression = f"{column} {operator} {value}".strip()
+            parts.append(expression + (f" and {upper}" if operator == "between" else ""))
+        prefix = "Pending | " if pending else f"Keeping {matched:,}/{len(self.df):,} records | "
+        _set_readonly_text(self.filter_summary_box, prefix + f" {self.filter_mode.get()} ".join(parts))
+
+    def render_preview(self):
+        if self.df is None:
+            return
+        filtered = self._filtered()
+        if self.filter_conditions:
+            self._show_filter_summary(matched=len(filtered))
+        if self.table is not None:
+            self.table.destroy()
+            self.table = None
+        columns = self.selected_columns()
+        if columns:
+            self.table = ResultsTable(self.table_holder, headers=columns, weights=[1] * len(columns))
+            self.table.pack(fill="both", expand=True)
+            copy_rows = filtered[columns].head(self.PREVIEW_ROWS).astype(str).values.tolist()
+            self.table.set_rows([[value[:180] for value in row] for row in copy_rows],
+                                copy_values=copy_rows)
+        self._update_summary(len(filtered))
+
+    def _update_summary(self, matched=None):
+        if self.df is None:
+            return
+        if matched is None:
+            matched = len(self._filtered())
+        columns = self.selected_columns()
+        if not columns:
+            self.summary_label.configure(text="Select at least one column to keep.")
+            return
+        fmt, _ext = convert_tools.CONVERT_FORMATS[self.format_menu.get()]
+        text = (f"Will convert {matched:,} of {len(self.df):,} records, {len(columns)} columns "
+                f"→ {self.format_menu.get()}")
+        if matched > self.PREVIEW_ROWS:
+            text += f" · preview shows the first {self.PREVIEW_ROWS}"
+        portable = convert_tools.portable_columns_for(columns, fmt)
+        if portable:
+            shown = ", ".join(map(str, portable[:4])) + (" …" if len(portable) > 4 else "")
+            text += f"\n{len(portable)} column(s) without a {self.format_menu.get().split()[0]} tag " \
+                    f"will be kept in the record Note: {shown}"
+        self.summary_label.configure(text=text, justify="left")
+
+    def on_convert(self):
+        if self.df is None:
+            return
+        columns = self.selected_columns()
+        if not columns:
+            messagebox.showwarning("No columns", "Select at least one column to keep.")
+            return
+        label = self.format_menu.get()
+        fmt, ext = convert_tools.CONVERT_FORMATS[label]
+        base = os.path.splitext(os.path.basename(self.file_path or "records"))[0]
+        path = filedialog.asksaveasfilename(
+            title="Save converted file", defaultextension=ext,
+            filetypes=[(label, f"*{ext}")], initialfile=f"{base}_converted{ext}")
+        if not path:
+            return
+        # A typed extension wins over the menu so the content matches the name.
+        chosen_ext = os.path.splitext(path)[1].lower().replace(".bibtex", ".bib")
+        fmt = next((f for f, e in convert_tools.CONVERT_FORMATS.values() if e == chosen_ext), fmt)
+        try:
+            count, portable = convert_tools.convert_file(
+                self.df, path, fmt, columns, self.filter_conditions, self.filter_mode.get())
+        except Exception as exc:
+            messagebox.showerror("Conversion failed", f"Couldn't save the converted file:\n{exc}")
+            return
+        extra = f"\n{len(portable)} column(s) were stored in the record Note." if portable else ""
+        messagebox.showinfo("Conversion complete", f"Saved {count:,} records to:\n{path}{extra}")
 
 
 if __name__ == "__main__":
