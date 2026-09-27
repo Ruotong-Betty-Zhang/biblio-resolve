@@ -193,7 +193,18 @@ def language_label_for_code(iso_code):
 
 
 class TranslationError(Exception):
-    """Raised when a translation request fails: bad key, quota, network, ..."""
+    """Raised when a translation request fails: bad key, quota, network, ...
+
+    ``completed`` maps positions in the texts passed to translate_texts()
+    to translations that did succeed before the failure, so the caller can
+    keep (and cache) them instead of spending quota on them again.
+    ``partial`` is set by translate_dataframe_fields() to its usual
+    (frame, done, total, stats) result covering everything finished so far."""
+
+    def __init__(self, message, completed=None):
+        super().__init__(message)
+        self.completed = completed or {}
+        self.partial = None
 
 
 def _normalize_lang_code(code):
@@ -397,12 +408,25 @@ def _mymemory_chunks(text):
 _MYMEMORY_QUOTA_MARKERS = ("mymemory warning", "quota exceeded", "you used all available free translations")
 
 
+def _mymemory_quota_message(response_text, email):
+    """Readable quota message, including MyMemory's own reset countdown."""
+    wait = re.search(r"NEXT AVAILABLE IN\s+(\d+)\s+HOURS?\s+(\d+)\s+MINUTES?", response_text or "", re.I)
+    when = (f" It resets in about {int(wait.group(1))} h {int(wait.group(2))} min." if wait else "")
+    advice = ("switch to Azure or DeepL" if email else
+              "add a contact email under Settings (raises the limit to 50,000 characters/day), "
+              "or switch to Azure or DeepL")
+    return ("MyMemory's free daily quota is used up (5,000 characters/day anonymously, 50,000/day "
+            f"with a contact email).{when} Records translated before this point are kept and cached, "
+            f"so running again later continues where it stopped. To continue now, {advice}.")
+
+
 def _translate_mymemory(texts, target_lang, email, source_lang, session):
     indices = _non_blank_indices(texts)
     results = list(texts)
     if not indices:
         return results
     session = session or requests.Session()
+    finished = []  # positions fully translated so far, reported if a later one fails
     for i in indices:
         text = texts[i]
         lang_from = source_lang or _detect_language(text)
@@ -416,25 +440,29 @@ def _translate_mymemory(texts, target_lang, email, source_lang, session):
             params = {"q": chunk, "langpair": f"{lang_from}|{target_lang}"}
             if email:
                 params["de"] = email
+            completed = {j: results[j] for j in finished}
             try:
                 response = session.get(MYMEMORY_ENDPOINT, params=params, timeout=20)
             except requests.RequestException as exc:
-                raise TranslationError(f"Network error contacting MyMemory: {exc}") from exc
+                raise TranslationError(f"Network error contacting MyMemory: {exc}", completed) from exc
+            # The quota answer can arrive as HTTP 429 or as a 200 whose
+            # "translation" is the warning text; check before anything else.
+            body = response.text or ""
+            if response.status_code == 429 or any(marker in body.lower() for marker in _MYMEMORY_QUOTA_MARKERS):
+                raise TranslationError(_mymemory_quota_message(body, email), completed)
             if not response.ok:
-                raise TranslationError(f"MyMemory error {response.status_code}: {response.text[:300]}")
+                raise TranslationError(f"MyMemory error {response.status_code}: {body[:300]}", completed)
             payload = response.json()
             if payload.get("responseStatus") not in (200, "200"):
                 raise TranslationError(
                     f"MyMemory couldn't translate this text: "
-                    f"{payload.get('responseDetails', 'unknown error')}")
+                    f"{payload.get('responseDetails', 'unknown error')}", completed)
             translated = payload.get("responseData", {}).get("translatedText", chunk)
             if any(marker in translated.lower() for marker in _MYMEMORY_QUOTA_MARKERS):
-                raise TranslationError(
-                    "MyMemory's free daily quota is used up for today (5,000 characters/day "
-                    "anonymously, 50,000/day with a contact email set in Settings). Try again "
-                    "tomorrow, or add an email, or switch provider.")
+                raise TranslationError(_mymemory_quota_message(translated, email), completed)
             translated_parts.append(translated)
         results[i] = " ".join(translated_parts)
+        finished.append(i)
     return results
 
 
@@ -546,9 +574,29 @@ def translate_dataframe_fields(dataframe, columns, target_lang, provider, api_ke
                 else:
                     to_fetch.append(i)
             if to_fetch:
-                translated_fresh = translate_texts(
-                    [chunk_originals[i] for i in to_fetch], target_lang, provider, api_key,
-                    region=region, source_lang=source_lang, session=session)
+                try:
+                    translated_fresh = translate_texts(
+                        [chunk_originals[i] for i in to_fetch], target_lang, provider, api_key,
+                        region=region, source_lang=source_lang, session=session)
+                except TranslationError as exc:
+                    # Keep what this batch did finish (and cache it, so the
+                    # quota it cost isn't spent again), then hand the caller
+                    # everything completed so far.
+                    for position, translated in exc.completed.items():
+                        i = to_fetch[position]
+                        col_stats["freshly_translated"] += 1
+                        if cache is not None:
+                            key = _translate_cache_key(chunk_originals[i], target_lang, provider)
+                            cache[key] = translated
+                            append_translate_cache_entry(key, translated)
+                        frame.iat[start + i, col_loc] = _combine_original_and_translation(
+                            chunk_originals[i], translated)
+                    for i in range(len(chunk_originals)):
+                        if i not in to_fetch and i in pending:  # served from cache
+                            frame.iat[start + i, col_loc] = _combine_original_and_translation(
+                                chunk_originals[i], translated_chunk[i])
+                    exc.partial = (frame, done, total, stats)
+                    raise
                 for i, translated in zip(to_fetch, translated_fresh):
                     translated_chunk[i] = translated
                     col_stats["freshly_translated"] += 1

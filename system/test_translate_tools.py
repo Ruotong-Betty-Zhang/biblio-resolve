@@ -158,6 +158,26 @@ class TranslateMyMemoryTests(unittest.TestCase):
                 ["Dies ist ein deutscher Satz, der übersetzt werden muss."], "en", "mymemory",
                 api_key=None, session=session)
 
+    def test_http_429_quota_gives_readable_message_with_reset_time(self):
+        body = ('{"responseData":{"translatedText":"MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE '
+                'TRANSLATIONS FOR TODAY. NEXT AVAILABLE IN  03 HOURS 54 MINUTES 52 SECONDS"}}')
+        session = FakeSession([FakeResponse(429, None, text=body)])
+        with self.assertRaises(tools.TranslationError) as caught:
+            tools.translate_texts(["Hallo Welt, das ist ein Satz."], "en", "mymemory",
+                                  api_key=None, source_lang="de", session=session)
+        message = str(caught.exception)
+        self.assertIn("quota is used up", message)
+        self.assertIn("3 h 54 min", message)
+        self.assertNotIn("responseData", message)
+
+    def test_failure_reports_texts_already_translated(self):
+        ok = FakeResponse(200, {"responseData": {"translatedText": "One"}, "responseStatus": 200})
+        session = FakeSession([ok, FakeResponse(429, None, text="MYMEMORY WARNING")])
+        with self.assertRaises(tools.TranslationError) as caught:
+            tools.translate_texts(["Eins", "Zwei"], "en", "mymemory", api_key=None,
+                                  source_lang="de", session=session)
+        self.assertEqual(caught.exception.completed, {0: "One"})
+
     def test_long_text_is_split_into_multiple_requests_and_rejoined(self):
         long_text = "Dies ist ein deutscher Satz. " * 40  # well over 480 bytes
         self.assertGreater(len(long_text.encode("utf-8")), tools.MYMEMORY_MAX_REQUEST_BYTES)
@@ -327,6 +347,31 @@ class TranslateDataframeFieldsTests(unittest.TestCase):
 
         # 3 rows x 2 columns = 6 total; Title done in batches of 2 then 1, then Abstract likewise.
         self.assertEqual(calls, [(2, 6), (3, 6), (5, 6), (6, 6)])
+
+    def test_failure_keeps_and_caches_rows_translated_so_far(self):
+        df = pd.DataFrame({"Title": ["A", "B", "C", "D"]})
+        calls = []
+
+        def fake_translate_texts(texts, target_lang, provider, api_key, region=None,
+                                  source_lang=None, session=None):
+            calls.append(list(texts))
+            if len(calls) == 1:
+                return [f"{t}-x" for t in texts]
+            raise tools.TranslationError("quota", completed={0: "C-x"})
+
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(tools, "TRANSLATE_CACHE_FILE", str(Path(folder) / "cache.jsonl")), \
+                mock.patch.object(tools, "already_in_target_language", return_value=False), \
+                mock.patch.object(tools, "translate_texts", side_effect=fake_translate_texts):
+            with self.assertRaises(tools.TranslationError) as caught:
+                tools.translate_dataframe_fields(
+                    df, ["Title"], "en", "mymemory", None, batch_size=2, request_delay=0)
+            frame, done, total, _stats = caught.exception.partial
+            cached = tools.load_translate_cache()
+
+        self.assertEqual(list(frame["Title"]), ["A [A-x]", "B [B-x]", "C [C-x]", "D"])
+        self.assertEqual((done, total), (2, 4))
+        self.assertEqual(sorted(cached.values()), ["A-x", "B-x", "C-x"])
 
     def test_stops_early_leaving_untouched_rows_as_original(self):
         df = pd.DataFrame({"Title": ["A", "B", "C", "D"]})

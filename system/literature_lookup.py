@@ -5066,9 +5066,10 @@ class TranslatePage(ctk.CTkFrame):
                     progress_callback=lambda done, total: self.events.put(("progress", (done, total))))
                 self.events.put(("done", (result_df, title_column, abstract_column, done, total, stats)))
             except translate_tools.TranslationError as exc:
-                self.events.put(("error", str(exc)))
+                partial = (exc.partial, title_column, abstract_column) if exc.partial else None
+                self.events.put(("error", (str(exc), partial)))
             except Exception as exc:
-                self.events.put(("error", str(exc)))
+                self.events.put(("error", (str(exc), None)))
         threading.Thread(target=worker, daemon=True).start()
 
     def on_stop(self):
@@ -5097,9 +5098,22 @@ class TranslatePage(ctk.CTkFrame):
                     _set_readonly_text(self.stats_box, translate_tools.format_stats_summary(stats))
                     self._show_results(title_column, abstract_column)
                 elif kind == "error":
+                    message, partial = payload
                     self.running = False
                     self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
-                    messagebox.showerror("Translation failed", payload)
+                    if partial is not None:
+                        # Keep what was translated before the failure visible
+                        # and exportable instead of discarding it.
+                        (self.output_df, done, total, stats), title_column, abstract_column = partial
+                        self.export_btn.configure(state="normal")
+                        self.status_var.set(
+                            f"Stopped after {done:,}/{total:,}: translation failed. Rows translated so far "
+                            "are shown and can be exported; they're cached, so a later run skips them.")
+                        _set_readonly_text(self.stats_box, translate_tools.format_stats_summary(stats))
+                        self._show_results(title_column, abstract_column)
+                    else:
+                        self.status_var.set("Translation failed.")
+                    messagebox.showerror("Translation stopped", message)
         except queue.Empty:
             pass
         self.after(150, self._poll_events)
