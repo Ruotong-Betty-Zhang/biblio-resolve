@@ -136,13 +136,21 @@ def _set_readonly_text_autosize(textbox, value, min_height=90, max_height=280, l
     max_height) instead of leaving it at a fixed height the user has to drag
     open or scroll through by hand."""
     _set_readonly_text(textbox, value)
-    textbox.update_idletasks()
+    # Only an unmapped box needs a full layout pass to learn its width; once
+    # shown, "update" makes the count wrap lines itself. update_idletasks()
+    # would re-lay-out (and redraw the scrollbars of) the whole window.
+    if textbox.winfo_width() <= 1:
+        textbox.update_idletasks()
     try:
-        lines = textbox._textbox.count("1.0", "end", "displaylines")
-        lines = lines[0] if lines else 1
+        lines = textbox._textbox.count("1.0", "end", "update", "displaylines")
+        if isinstance(lines, (tuple, list)):  # an int when "update" is passed
+            lines = lines[0] if lines else 1
+        lines = lines or 1
     except Exception:
         lines = 1
-    textbox.configure(height=min(max_height, max(min_height, lines * line_height + 24)))
+    height = min(max_height, max(min_height, lines * line_height + 24))
+    if textbox.cget("height") != height:
+        textbox.configure(height=height)
 
 
 def _copy_textbox(widget, textbox):
@@ -1822,6 +1830,10 @@ class ManualReviewPage(ctk.CTkFrame):
     def _display_value(value):
         if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
             return ""
+        # Blank cells make pandas read whole-number columns (years, volumes)
+        # as floats; show 1999.0 as 1999.
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
         return str(value)
 
     @staticmethod
@@ -2078,8 +2090,13 @@ class ManualReviewDialog(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.topmost_var = ctk.BooleanVar(value=False)
         self.show_compare_var = ctk.BooleanVar(value=True)
+        # Fields open read-only so browsing can't change data by accident.
+        self.edit_mode_var = ctk.BooleanVar(value=False)
         self.field_entries = {}   # field label -> (widget getter, column name or None, canonical new-column name)
         self.other_editors = {}   # column name -> getter for the "All fields" view
+        self.input_fallbacks = {}  # field label -> lookup value shown because the record's own cell is empty
+        self._all_field_widgets = {}  # column -> (label, editor, is_textbox), reused between records
+        self._comparison_rows = {}  # field label -> widgets of its key-field row, reused between records
 
         header = ctk.CTkFrame(self)
         header.pack(fill="x", padx=10, pady=(10, 6))
@@ -2093,6 +2110,10 @@ class ManualReviewDialog(ctk.CTkToplevel):
             header, values=["Key fields", "All fields"], command=lambda _v: self._on_view_change())
         self.view_toggle.set("Key fields")
         self.view_toggle.pack(side="left", padx=8)
+        self.edit_switch = ctk.CTkSwitch(
+            header, text="Edit fields: OFF (view only)", variable=self.edit_mode_var,
+            command=self._on_view_change)
+        self.edit_switch.pack(side="left", padx=(16, 8))
         self.topmost_switch = ctk.CTkSwitch(
             header, text="Keep on top", variable=self.topmost_var,
             command=self._toggle_topmost)
@@ -2115,10 +2136,10 @@ class ManualReviewDialog(ctk.CTkToplevel):
         ctk.CTkLabel(headings, text="Field", width=145, anchor="w",
                      font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w")
         self.input_heading = ctk.CTkLabel(
-            headings, text="Input record (editable)", anchor="w", font=ctk.CTkFont(weight="bold"))
+            headings, text="Input record", anchor="w", font=ctk.CTkFont(weight="bold"))
         self.input_heading.grid(row=0, column=1, sticky="w", padx=5)
         self.retrieved_heading = ctk.CTkLabel(
-            headings, text="Retrieved verification metadata", anchor="w",
+            headings, text="Retrieved metadata (from this file)", anchor="w",
             font=ctk.CTkFont(weight="bold"))
         self.retrieved_heading.grid(row=0, column=3, sticky="w", padx=5)
 
@@ -2263,73 +2284,161 @@ class ManualReviewDialog(ctk.CTkToplevel):
             self.retrieved_heading.grid_remove()
         self.comparison_frame.grid_columnconfigure(3, weight=1 if show_compare else 0)
         self.comparison_frame.grid_columnconfigure(2, minsize=105 if show_compare else 0)
+        editable = bool(self.edit_mode_var.get())
+        mode = "editable" if editable else "view only"
+        self.edit_switch.configure(
+            text="Edit fields: ON" if editable else "Edit fields: OFF (view only)")
         if all_fields:
-            self.input_heading.configure(text="Value (editable)")
+            self.input_heading.configure(text=f"Value ({mode})")
             self.comparison_frame.pack_forget()
             self.all_fields_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(3, 6))
         else:
-            self.input_heading.configure(text="Input record (editable)")
+            self.input_heading.configure(text=f"Input record ({mode})")
             self.all_fields_frame.pack_forget()
             self.comparison_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(3, 6))
 
+    @staticmethod
+    def _needs_textbox(value):
+        return len(value) > 150 or "\n" in value
+
+    def _set_editor_value(self, widget, value):
+        """Replace an editor's text and apply the current edit/view state."""
+        editable = bool(self.edit_mode_var.get())
+        widget.configure(state="normal")
+        if isinstance(widget, ctk.CTkTextbox):
+            widget.delete("1.0", "end")
+            widget.insert("1.0", value)
+            if not editable:
+                widget.configure(state="disabled")
+        else:
+            widget.delete(0, "end")
+            widget.insert(0, value)
+            if not editable:
+                widget.configure(state="readonly")
+
     def _make_editor(self, parent, value, width=None, grid=None):
         """A single-line entry, or a small textbox for long/multi-line values.
-        Returns (widget, getter)."""
-        if len(value) > 150 or "\n" in value:
+        Returns (widget, getter). Outside edit mode the widget is read-only
+        (text can still be selected and copied)."""
+        if self._needs_textbox(value):
             widget = ctk.CTkTextbox(parent, height=80, wrap="word", font=ctk.CTkFont(size=13))
-            widget.insert("1.0", value)
             getter = lambda w=widget: w.get("1.0", "end-1c").strip()
         else:
             widget = ctk.CTkEntry(parent) if width is None else ctk.CTkEntry(parent, width=width)
-            widget.insert(0, value)
             getter = lambda w=widget: w.get().strip()
+        self._set_editor_value(widget, value)
         return widget, getter
 
     def _add_comparison_row(self, row_number, field, input_value, retrieved_value,
-                            column=None, new_column_name=None):
+                            column=None, new_column_name=None, retrieved_column="",
+                            input_fallback_column=""):
+        """Show one key field. The row's widgets are built on first use and
+        afterwards only updated in place: destroying and recreating them for
+        every record made moving between records take seconds."""
         show_compare = bool(self.show_compare_var.get())
         if show_compare:
             category, explanation = self._compare(field, input_value, retrieved_value)
         else:
             category, explanation = "missing", ""
         color = self._row_color(category)
+        widgets = self._comparison_rows.get(field)
+        if widgets is None:
+            widgets = self._build_comparison_row(row_number, field)
+
+        # Input side. Swap entry/textbox only when the value's length needs it.
+        holder = widgets["holder"]
+        holder.configure(fg_color=color if show_compare else "transparent")
+        if widgets["is_textbox"] != self._needs_textbox(input_value):
+            widgets["editor"].destroy()
+            widgets["editor"], _getter = self._make_editor(holder, input_value)
+            widgets["editor"].grid(row=0, column=0, sticky="ew", padx=(7, 2), pady=6)
+            widgets["is_textbox"] = self._needs_textbox(input_value)
+        else:
+            self._set_editor_value(widgets["editor"], input_value)
+        widgets["editor"].configure(
+            text_color=(("gray40", "gray65") if input_fallback_column
+                        else ctk.ThemeManager.theme["CTkEntry"]["text_color"]))
+        self.field_entries[field] = (widgets["getter"], column, new_column_name)
+        if input_fallback_column:
+            self.input_fallbacks[field] = input_value
+            widgets["fallback_label"].configure(
+                text=f"empty in record · showing lookup column: {input_fallback_column}")
+            widgets["fallback_label"].grid()
+        else:
+            widgets["fallback_label"].grid_remove()
+
+        # Retrieved side.
+        if not show_compare:
+            widgets["ret_holder"].grid_remove()
+            widgets["symbol"].grid_remove()
+            return
+        widgets["ret_holder"].grid()
+        widgets["symbol"].grid()
+        widgets["ret_holder"].configure(fg_color=color)
+        widgets["retrieved"] = retrieved_value
+        direct_url = self._clickable_url(field, retrieved_value) if field in {"DOI", "URL"} else ""
+        widgets["retrieved_url"] = direct_url
+        widgets["value_label"].configure(
+            text=retrieved_value or "(not available)",
+            text_color=(("#1261a0", "#69b7ff") if direct_url
+                        else ctk.ThemeManager.theme["CTkLabel"]["text_color"]),
+            cursor="hand2" if direct_url else "")
+        if retrieved_column:
+            widgets["source_label"].configure(text=f"from column: {retrieved_column}")
+            widgets["source_label"].grid()
+        else:
+            widgets["source_label"].grid_remove()
+        symbol = {"match": "✓", "warning": "!", "different": "×", "missing": "—"}[category]
+        widgets["symbol"].configure(text=f"{symbol}\n{explanation}")
+
+    def _build_comparison_row(self, row_number, field):
+        widgets = {"retrieved": "", "retrieved_url": ""}
         ctk.CTkLabel(self.comparison_frame, text=field, width=140, anchor="w",
                      font=ctk.CTkFont(weight="bold")).grid(row=row_number, column=0, sticky="nw", padx=6, pady=4)
-
-        holder = ctk.CTkFrame(self.comparison_frame, fg_color=color if show_compare else "transparent")
+        holder = ctk.CTkFrame(self.comparison_frame)
         holder.grid(row=row_number, column=1, sticky="nsew", padx=4, pady=3)
         holder.grid_columnconfigure(0, weight=1)
-        editor, getter = self._make_editor(holder, input_value)
-        editor.grid(row=0, column=0, sticky="ew", padx=(7, 2), pady=6)
-        self.field_entries[field] = (getter, column, new_column_name)
-        direct = (lambda: self._clickable_url(field, getter())) if field in {"DOI", "URL"} else None
-        if direct:
-            ctk.CTkButton(holder, text="Open", width=48, height=24,
-                          command=lambda: direct() and webbrowser.open(direct())).grid(
-                              row=0, column=1, padx=(2, 2), pady=4)
+        widgets["holder"] = holder
+        widgets["editor"], _getter = self._make_editor(holder, "")
+        widgets["editor"].grid(row=0, column=0, sticky="ew", padx=(7, 2), pady=6)
+        widgets["is_textbox"] = False
+        getter = lambda: (widgets["editor"].get("1.0", "end-1c").strip() if widgets["is_textbox"]
+                          else widgets["editor"].get().strip())
+        widgets["getter"] = getter
+        widgets["fallback_label"] = ctk.CTkLabel(
+            holder, text="", anchor="w", font=ctk.CTkFont(size=11), text_color=("#8a5a00", "#e0b060"))
+        widgets["fallback_label"].grid(row=1, column=0, columnspan=3, sticky="w", padx=7, pady=(0, 4))
+        if field in {"DOI", "URL"}:
+            def open_input():
+                url = self._clickable_url(field, getter())
+                if url:
+                    webbrowser.open(url)
+            ctk.CTkButton(holder, text="Open", width=48, height=24, command=open_input).grid(
+                row=0, column=1, padx=(2, 2), pady=4)
         ctk.CTkButton(holder, text="Copy", width=48, height=24,
                       command=lambda: self._copy_value(getter())).grid(
                           row=0, column=2, padx=(2, 5), pady=4)
 
-        if not show_compare:
-            return
-        ret_holder = ctk.CTkFrame(self.comparison_frame, fg_color=color)
+        ret_holder = ctk.CTkFrame(self.comparison_frame)
         ret_holder.grid(row=row_number, column=3, sticky="nsew", padx=4, pady=3)
         ret_holder.grid_columnconfigure(0, weight=1)
-        value_label = ctk.CTkLabel(ret_holder, text=retrieved_value or "(not available)", anchor="w",
-                                   justify="left", wraplength=390)
+        widgets["ret_holder"] = ret_holder
+        value_label = ctk.CTkLabel(ret_holder, text="", anchor="w", justify="left", wraplength=390)
         value_label.grid(row=0, column=0, sticky="ew", padx=7, pady=6)
-        direct_url = self._clickable_url(field, retrieved_value) if field in {"DOI", "URL"} else ""
-        if direct_url:
-            value_label.configure(text_color=("#1261a0", "#69b7ff"), cursor="hand2")
-            value_label.bind("<Button-1>", lambda _event, url=direct_url: webbrowser.open(url))
+        value_label.bind("<Button-1>", lambda _event: widgets["retrieved_url"]
+                         and webbrowser.open(widgets["retrieved_url"]))
+        widgets["value_label"] = value_label
         ctk.CTkButton(ret_holder, text="Copy", width=48, height=24,
-                      command=lambda item=retrieved_value: self._copy_value(item)).grid(
+                      command=lambda: self._copy_value(widgets["retrieved"])).grid(
                           row=0, column=1, padx=(2, 5), pady=4)
-        symbol = {"match": "✓", "warning": "!", "different": "×", "missing": "—"}[category]
-        ctk.CTkLabel(self.comparison_frame, text=f"{symbol}\n{explanation}", width=105,
-                     justify="center", text_color=("gray20", "gray80")).grid(
-                         row=row_number, column=2, sticky="nsew", padx=3, pady=4)
+        widgets["source_label"] = ctk.CTkLabel(
+            ret_holder, text="", anchor="w", font=ctk.CTkFont(size=11), text_color=("gray35", "gray65"))
+        widgets["source_label"].grid(row=1, column=0, columnspan=2, sticky="w", padx=7, pady=(0, 4))
+        widgets["symbol"] = ctk.CTkLabel(self.comparison_frame, text="", width=105,
+                                         justify="center", text_color=("gray20", "gray80"))
+        widgets["symbol"].grid(row=row_number, column=2, sticky="nsew", padx=3, pady=4)
+        self._comparison_rows[field] = widgets
+        return widgets
 
     # Key fields: label, input aliases, name used when the column must be created.
     EDITABLE_FIELDS = [
@@ -2343,17 +2452,78 @@ class ManualReviewDialog(ctk.CTkToplevel):
         ("URL", core.URL_ALIASES, "Url"),
     ]
 
+    # Columns already in the loaded file that hold looked-up / verified
+    # values, in priority order. Verification output comes first, then the
+    # lookup step's own columns (lowercase doi/url/matched_title from the
+    # lookup scripts, Matched Title/Link from Batch Lookup), then Abstract
+    # Finder's page metadata. Nothing is fetched from the network here.
+    RETRIEVED_COLUMNS = {
+        "Title": ("Verification Metadata Combined Title", "Verification Metadata Title",
+                  "Matched Title", "matched_title", "Abstract Page Title"),
+        "Authors": ("Verification Metadata Authors", "Abstract Page Authors"),
+        "Publication year": ("Verification Metadata Year", "Abstract Page Year"),
+        "Item type": ("Verification Metadata Item Type",),
+        "Publisher": ("Verification Metadata Publisher",),
+        "Publication / container": ("Verification Metadata Container Title",),
+        "DOI": ("Verification Metadata DOI", "doi", "Abstract Page DOI"),
+        "URL": ("Resolved URL", "url", "Link", "Resource URL"),
+    }
+    _ALL_RETRIEVED_COLUMNS = frozenset(
+        name for names in RETRIEVED_COLUMNS.values() for name in names)
+
+    def _input_column(self, columns, field, aliases):
+        """The record's own column for a field. Retrieved-value columns are
+        excluded, so e.g. the original ``DOI`` is used rather than the
+        lookup's lowercase ``doi`` (case-insensitive guessing picked that)."""
+        original = [c for c in columns if c not in self._ALL_RETRIEVED_COLUMNS]
+        return core.guess_column(original, aliases)
+
+    # Lookup-step columns shown on the input side when the record's own cell
+    # is empty. Shown only; never written back unless the user edits them.
+    LOOKUP_INPUT_FALLBACKS = {
+        "Title": ("matched_title", "Matched Title"),
+        "DOI": ("doi",),
+        "URL": ("url", "Link"),
+    }
+
+    def _lookup_fallback(self, row, field, input_column):
+        for name in self.LOOKUP_INPUT_FALLBACKS.get(field, ()):
+            if name != input_column and name in row.index:
+                value = self.review_page._display_value(row.get(name, "")).strip()
+                if value:
+                    return value, name
+        return "", ""
+
+    def _retrieved_value(self, row, field, input_column):
+        """(value, column name) of the first non-empty retrieved column."""
+        for name in self.RETRIEVED_COLUMNS[field]:
+            if name != input_column and name in row.index:
+                value = self.review_page._display_value(row.get(name, "")).strip()
+                if value:
+                    return value, name
+        if field == "DOI":
+            resolved = self._column_value(row, [], ("Resolved URL",))
+            if "doi.org/" in resolved.casefold():
+                return core.normalize_doi(resolved), "Resolved URL"
+        return "", ""
+
     def _commit_fields(self):
         """Write edited field values back into the DataFrame. Returns True if anything changed."""
         if not self.queue_indices or not (self.field_entries or self.other_editors):
             return False
         page, index = self.review_page, self._current_index()
         changed, new_columns = False, False
-        edits = [(column or new_name, getter, column is None)
-                 for getter, column, new_name in self.field_entries.values()]
-        edits += [(column, getter, False) for column, getter in self.other_editors.items()]
-        for column, getter, is_new in edits:
+        edits = [(column or new_name, getter, self.input_fallbacks.get(field))
+                 for field, (getter, column, new_name) in self.field_entries.items()]
+        edits += [(column, getter, None) for column, getter in self.other_editors.items()]
+        for column, getter, fallback in edits:
             text = getter()
+            if fallback and text == fallback:
+                continue  # an untouched lookup value shown in an empty cell
+            if not text and fallback is not None:
+                # The user cleared a displayed lookup value; the record's
+                # own cell was empty all along.
+                continue
             if column not in page.df.columns:
                 if not text:
                     continue
@@ -2373,52 +2543,57 @@ class ManualReviewDialog(ctk.CTkToplevel):
         return changed
 
     def _build_all_fields(self, row):
-        for child in self.all_fields_frame.winfo_children():
-            child.destroy()
+        """Fill the "All fields" view. Widgets are created once and then only
+        have their text replaced, since rebuilding 100+ CustomTkinter widgets
+        on every record took seconds."""
         self.other_editors = {}
         mapped = {column for _getter, column, _n in self.field_entries.values() if column}
         skip = mapped | {"Manual Decision", "Manual Notes"}
-        number = 0
-        for column in row.index:
-            if column in skip:
-                continue
-            ctk.CTkLabel(self.all_fields_frame, text=str(column), width=200, anchor="nw",
-                         wraplength=190, justify="left").grid(
-                             row=number, column=0, sticky="nw", padx=6, pady=4)
+        columns = [column for column in row.index if column not in skip]
+        for column in set(self._all_field_widgets) - set(columns):
+            label, editor, _is_textbox = self._all_field_widgets.pop(column)
+            label.destroy()
+            editor.destroy()
+        for number, column in enumerate(columns):
             value = self.review_page._display_value(row.get(column, "")).strip()
-            editor, getter = self._make_editor(self.all_fields_frame, value)
+            cached = self._all_field_widgets.get(column)
+            if cached and cached[2] == self._needs_textbox(value):
+                label, editor, is_textbox = cached
+                self._set_editor_value(editor, value)
+                getter = ((lambda w=editor: w.get("1.0", "end-1c").strip()) if is_textbox
+                          else (lambda w=editor: w.get().strip()))
+            else:
+                if cached:
+                    cached[1].destroy()
+                    label = cached[0]
+                else:
+                    label = ctk.CTkLabel(self.all_fields_frame, text=str(column), width=200, anchor="nw",
+                                         wraplength=190, justify="left")
+                editor, getter = self._make_editor(self.all_fields_frame, value)
+                self._all_field_widgets[column] = (label, editor, self._needs_textbox(value))
+            label.grid(row=number, column=0, sticky="nw", padx=6, pady=4)
             editor.grid(row=number, column=1, sticky="ew", padx=4, pady=3)
             self.other_editors[column] = getter
-            number += 1
 
     def _load_record(self):
         if not self.queue_indices:
             return
         row = self.review_page.df.loc[self._current_index()]
-        for child in self.comparison_frame.winfo_children():
-            child.destroy()
         self.field_entries = {}
-        resolved_url = self._column_value(row, [], ("Resolved URL",))
-        retrieved_doi = self._column_value(row, [], ("Verification Metadata DOI",))
-        if not retrieved_doi and resolved_url and "doi.org/" in resolved_url.casefold():
-            retrieved_doi = core.normalize_doi(resolved_url)
-        retrieved = {
-            "Title": self._column_value(
-                row, [], ("Verification Metadata Combined Title", "Verification Metadata Title")),
-            "Authors": self._column_value(row, [], ("Verification Metadata Authors",)),
-            "Publication year": self._column_value(row, [], ("Verification Metadata Year",)),
-            "Item type": self._column_value(row, [], ("Verification Metadata Item Type",)),
-            "Publisher": self._column_value(row, [], ("Verification Metadata Publisher",)),
-            "Publication / container": self._column_value(
-                row, [], ("Verification Metadata Container Title",)),
-            "DOI": retrieved_doi,
-            "URL": resolved_url,
-        }
+        self.input_fallbacks = {}
         for number, (field, aliases, new_name) in enumerate(self.EDITABLE_FIELDS):
-            column = core.guess_column(row.index, aliases)
+            column = self._input_column(row.index, field, aliases)
             value = self.review_page._display_value(row.get(column, "")).strip() if column else ""
-            self._add_comparison_row(number, field, value, retrieved[field], column, new_name)
-        self._build_all_fields(row)
+            fallback_column = ""
+            if not value:
+                value, fallback_column = self._lookup_fallback(row, field, column)
+            retrieved, retrieved_column = self._retrieved_value(row, field, column)
+            self._add_comparison_row(number, field, value, retrieved, column, new_name,
+                                     retrieved_column, fallback_column)
+        if self.view_toggle.get() == "All fields":
+            self._build_all_fields(row)
+        else:
+            self.other_editors = {}  # built only when that view is opened
 
         status = self._column_value(row, [], ("Verification Status",)) or "(no verification status)"
         lookup_status = (self.review_page._display_value(
