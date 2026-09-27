@@ -487,14 +487,17 @@ class ResultsTable(ctk.CTkFrame):
     def _text(value):
         return "" if value is None else str(value)
 
-    def set_rows(self, rows_values, copy_values=None):
+    def set_rows(self, rows_values, copy_values=None, row_tags=None):
+        """``row_tags`` optionally gives each row a Treeview tag (configured
+        by the caller with tree.tag_configure) instead of zebra striping."""
         self.clear()
         source = copy_values if copy_values is not None else rows_values
         self.copy_values = [[self._text(value) for value in row] for row in source]
         for index, values in enumerate(rows_values):
+            tag = row_tags[index] if row_tags is not None else (
+                "evenrow" if index % 2 == 0 else "oddrow")
             self.tree.insert("", "end", iid=str(index),
-                             values=[self._text(value) for value in values],
-                             tags=("evenrow" if index % 2 == 0 else "oddrow",))
+                             values=[self._text(value) for value in values], tags=(tag,))
 
     def _cell_at(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell":
@@ -4179,65 +4182,268 @@ class StatisticsPage(ctk.CTkFrame):
 
 
 # ---------------------------------------------------------------------------
-# Compare documents: diff two bibliography files (added/removed/changed
-# records). See compare_tools.py for the (unit-tested) matching/diff logic.
+# Compare documents: match two files on user-chosen column pairs (Title
+# required) and diff chosen column pairs. See compare_tools.py
+# (compare_by_column_pairs) for the unit-tested matching/diff logic.
 # ---------------------------------------------------------------------------
 
 class CompareDocumentsPage(ctk.CTkFrame):
+    """Match the records of two files on chosen column pairs (Title required)
+    and show, one row per record, how the chosen compared columns differ."""
+
+    STATUS_COLORS = {  # (light, dark) row backgrounds per comparison status
+        compare_tools.DIFFERENT: ("#FBE3E4", "#4B2326"),
+        compare_tools.SAME: ("#E6F4E9", "#1F3A26"),
+        compare_tools.ONLY_A: ("#FFF1D6", "#4A3B14"),
+        compare_tools.ONLY_B: ("#E3EEFB", "#1D3350"),
+        compare_tools.NO_TITLE: ("#ECECEC", "#3A3A3A"),
+    }
+    ALL_FILTER = "All"
+    ANY_COLUMN = "(any column)"
+
     def __init__(self, master):
         super().__init__(master, fg_color="transparent")
         self.df_a = self.df_b = None
-        self.path_a = self.path_b = None
-        self.changes = []
+        self.records, self.summary, self.visible_records = [], None, []
+        self.match_pairs = []       # (row frame, combo A, combo B) for extra match keys
+        self.compare_pairs = []     # [column A, column B, selected]
+        self.used_title_pair = None
+        self.used_match_pairs = []
 
         file_row = ctk.CTkFrame(self, fg_color="transparent")
         file_row.pack(fill="x", padx=4, pady=(6, 4))
         ctk.CTkButton(file_row, text="Choose file A…", width=130,
-                     command=lambda: self.on_choose_file("a")).pack(side="left")
+                      command=lambda: self.on_choose_file("a")).pack(side="left")
         self.label_a = ctk.CTkLabel(file_row, text="File A not chosen", anchor="w")
         self.label_a.pack(side="left", padx=(8, 24))
         ctk.CTkButton(file_row, text="Choose file B…", width=130,
-                     command=lambda: self.on_choose_file("b")).pack(side="left")
+                      command=lambda: self.on_choose_file("b")).pack(side="left")
         self.label_b = ctk.CTkLabel(file_row, text="File B not chosen", anchor="w")
         self.label_b.pack(side="left", padx=(8, 0))
+        self.setup_toggle = ctk.CTkButton(file_row, text="Hide setup ▲", width=120,
+                                          command=self._toggle_setup)
+        self.setup_toggle.pack(side="right")
 
-        self.title_a, self.doi_a, self.year_a = self._file_mapping_group(self, "File A columns")
-        self.title_b, self.doi_b, self.year_b = self._file_mapping_group(self, "File B columns")
+        # --- Setup: match keys (left) and compared columns (right) ---------
+        self.setup = ctk.CTkFrame(self, fg_color="transparent")
+        self.setup.pack(fill="x", padx=4, pady=(0, 4))
+        self.setup.grid_columnconfigure(0, weight=2, uniform="setup")
+        self.setup.grid_columnconfigure(1, weight=3, uniform="setup")
 
+        match_card = ctk.CTkFrame(self.setup)
+        match_card.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        ctk.CTkLabel(match_card, text="1. Match records by", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 2))
+        header = ctk.CTkFrame(match_card, fg_color="transparent")
+        header.pack(fill="x", padx=10)
+        ctk.CTkLabel(header, text="File A column", width=175, anchor="w",
+                     text_color=("gray35", "gray65")).pack(side="left")
+        ctk.CTkLabel(header, text="File B column", anchor="w",
+                     text_color=("gray35", "gray65")).pack(side="left", padx=(30, 0))
+        self.match_rows = ctk.CTkFrame(match_card, fg_color="transparent")
+        self.match_rows.pack(fill="x", padx=10)
+        title_row = ctk.CTkFrame(self.match_rows, fg_color="transparent")
+        title_row.pack(fill="x", pady=2)
+        self.title_a, self.title_b = self._pair_combos(title_row, width=175)
+        ctk.CTkLabel(title_row, text="Title · required", text_color=("#8a5a00", "#e0b060")).pack(
+            side="left", padx=(6, 0))
+        ctk.CTkButton(match_card, text="+ Add match column", width=150,
+                      command=self._add_match_pair).pack(anchor="w", padx=10, pady=(4, 2))
+        ctk.CTkLabel(
+            match_card,
+            text="Records are paired when their titles match (case and punctuation ignored). "
+                 "Extra match columns (e.g. DOI, Year, Author) only have to agree where both "
+                 "records have a value; among several same-title candidates the one agreeing "
+                 "on the most extra columns is used.",
+            text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11), anchor="w", justify="left",
+            wraplength=430).pack(fill="x", padx=10, pady=(0, 8))
+
+        compare_card = ctk.CTkFrame(self.setup)
+        compare_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        compare_header = ctk.CTkFrame(compare_card, fg_color="transparent")
+        compare_header.pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkLabel(compare_header, text="2. Columns to compare",
+                     font=ctk.CTkFont(weight="bold")).pack(side="left")
+        self.compare_count = ctk.CTkLabel(compare_header, text="", text_color=("gray35", "gray65"))
+        self.compare_count.pack(side="left", padx=10)
+        ctk.CTkButton(compare_header, text="Clear", width=60,
+                      command=lambda: self._select_shown_pairs(False)).pack(side="right")
+        ctk.CTkButton(compare_header, text="Select shown", width=100,
+                      command=lambda: self._select_shown_pairs(True)).pack(side="right", padx=6)
+        self.pair_filter = ctk.CTkEntry(compare_header, width=160, placeholder_text="Filter columns…")
+        self.pair_filter.pack(side="right")
+        self.pair_filter.bind("<KeyRelease>", lambda _event: self._render_compare_pairs())
+
+        pair_holder = ctk.CTkFrame(compare_card, fg_color="transparent")
+        pair_holder.pack(fill="both", expand=True, padx=10)
+        _style_literature_treeview(self)
+        self.pair_tree = ttk.Treeview(pair_holder, columns=("use", "a", "b"), show="headings",
+                                      style="Literature.Treeview", selectmode="none", height=5)
+        for column, heading, width in (("use", "Use", 60), ("a", "File A column", 260),
+                                       ("b", "File B column", 260)):
+            self.pair_tree.heading(column, text=heading, anchor="w")
+            self.pair_tree.column(column, width=width, minwidth=60, stretch=column != "use", anchor="w")
+        pair_scroll = ctk.CTkScrollbar(pair_holder, orientation="vertical", command=self.pair_tree.yview)
+        self.pair_tree.configure(yscrollcommand=pair_scroll.set)
+        self.pair_tree.pack(side="left", fill="both", expand=True)
+        pair_scroll.pack(side="left", fill="y", padx=(3, 0))
+        self.pair_tree.bind("<ButtonRelease-1>", self._toggle_pair)
+        self.pair_tree.tag_configure("on", foreground=_TREEVIEW_COLORS["accent"])
+
+        add_row = ctk.CTkFrame(compare_card, fg_color="transparent")
+        add_row.pack(fill="x", padx=10, pady=(4, 8))
+        ctk.CTkLabel(add_row, text="Pair differently named columns:",
+                     text_color=("gray35", "gray65")).pack(side="left", padx=(0, 6))
+        self.extra_a, self.extra_b = self._pair_combos(add_row, width=170)
+        ctk.CTkButton(add_row, text="Add pair", width=80, command=self._add_compare_pair).pack(
+            side="left", padx=(6, 0))
+
+        # --- Run --------------------------------------------------------------
         run_row = ctk.CTkFrame(self, fg_color="transparent")
-        run_row.pack(fill="x", padx=4, pady=(0, 6))
+        run_row.pack(fill="x", padx=4, pady=(2, 4))
         self.compare_btn = ctk.CTkButton(run_row, text="Compare", width=110,
                                          command=self.on_compare, state="disabled")
         self.compare_btn.pack(side="left")
-        self.export_btn = ctk.CTkButton(run_row, text="Export differences…", width=155,
+        self.ignore_case_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(run_row, text="Ignore case & punctuation in compared values",
+                        variable=self.ignore_case_var).pack(side="left", padx=14)
+        self.export_btn = ctk.CTkButton(run_row, text="Export shown records…", width=170,
                                         command=self.on_export, state="disabled")
-        self.export_btn.pack(side="left", padx=(6, 0))
-
+        self.export_btn.pack(side="right")
         self.status_var = ctk.StringVar(
-            value="Records are matched by DOI when both files have one, otherwise by a "
-                  "normalized title. Only records with at least one difference are shown.")
+            value="Choose both files, pick the match columns and the columns to compare, then click Compare.")
         ctk.CTkLabel(self, textvariable=self.status_var, anchor="w", justify="left",
-                    wraplength=1100).pack(fill="x", padx=4, pady=(0, 5))
-        self.stats_box = ctk.CTkTextbox(self, height=110, wrap="word", font=ctk.CTkFont(size=14))
-        self.stats_box.pack(fill="x", padx=4, pady=(0, 8))
-        _set_readonly_text(self.stats_box, "Choose both files, confirm the column mappings, then compare.")
+                     text_color=("gray30", "gray70"), wraplength=1400).pack(fill="x", padx=6, pady=(0, 4))
 
-        self.table = ResultsTable(
-            self, headers=["Status", "Title", "Field", "Old value", "New value"],
-            weights=[0, 2, 1, 2, 2])
-        self.table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+        # --- Result filters -----------------------------------------------------
+        filter_row = ctk.CTkFrame(self, fg_color="transparent")
+        filter_row.pack(fill="x", padx=4, pady=(0, 4))
+        self.status_filter = ctk.CTkSegmentedButton(
+            filter_row, values=[self.ALL_FILTER], command=lambda _value: self._render_results())
+        self.status_filter.set(self.ALL_FILTER)
+        self.status_filter.pack(side="left")
+        ctk.CTkLabel(filter_row, text="Column").pack(side="left", padx=(16, 6))
+        self.column_filter = ctk.CTkOptionMenu(
+            filter_row, values=[self.ANY_COLUMN], width=230, command=lambda _value: self._render_results())
+        self.column_filter.pack(side="left")
+        self.title_search = ctk.CTkEntry(filter_row, width=220, placeholder_text="Search title…")
+        self.title_search.pack(side="right")
+        self.title_search.bind("<KeyRelease>", lambda _event: self._render_results())
 
-    @staticmethod
-    def _file_mapping_group(parent, heading):
-        frame = ctk.CTkFrame(parent)
-        frame.pack(fill="x", padx=4, pady=(0, 4))
-        ctk.CTkLabel(frame, text=heading, font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(6, 0))
-        row = ctk.CTkFrame(frame, fg_color="transparent")
-        row.pack(fill="x")
-        title = NoteLinkRecoveryPage._mapping(row, "Title column", 0)
-        doi = NoteLinkRecoveryPage._mapping(row, "DOI column", 1)
-        year = NoteLinkRecoveryPage._mapping(row, "Year column (optional)", 2)
-        return title, doi, year
+        # Packed at the bottom first so the expanding results table below
+        # can never squeeze the side-by-side panel to nothing.
+        detail = ctk.CTkFrame(self)
+        detail.pack(side="bottom", fill="x", padx=4, pady=(0, 4))
+        self.detail_label = ctk.CTkLabel(detail, text="Select a record to see both files side by side.",
+                                         anchor="w", font=ctk.CTkFont(weight="bold"))
+        self.detail_label.pack(fill="x", padx=10, pady=(6, 2))
+        self.detail_table = ResultsTable(detail, headers=["Column", "File A", "File B"], weights=[1, 2, 2])
+        self.detail_table.tree.configure(height=6)
+        self.detail_table.tree.column("c0", width=280, stretch=False)
+        self.detail_table.tree.column("c1", width=520, stretch=True)
+        self.detail_table.tree.column("c2", width=520, stretch=True)
+        self._configure_status_tags(self.detail_table.tree)
+        self.detail_table.pack(fill="x", padx=8, pady=(0, 8))
+
+        self.results_holder = ctk.CTkFrame(self, fg_color="transparent")
+        self.results_holder.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.table = None
+        self._build_results_table([])
+
+    # -- setup helpers -------------------------------------------------------
+
+    def _pair_combos(self, parent, width=200):
+        combo_a = _make_searchable_combobox(parent, values=[NO_COLUMN], width=width)
+        combo_a.pack(side="left")
+        combo_a.set(NO_COLUMN)
+        ctk.CTkLabel(parent, text="↔", width=24).pack(side="left")
+        combo_b = _make_searchable_combobox(parent, values=[NO_COLUMN], width=width)
+        combo_b.pack(side="left")
+        combo_b.set(NO_COLUMN)
+        for combo, df_getter in ((combo_a, lambda: self.df_a), (combo_b, lambda: self.df_b)):
+            df = df_getter()
+            if df is not None:
+                _update_combobox_values(combo, [NO_COLUMN] + list(df.columns))
+        return combo_a, combo_b
+
+    def _add_match_pair(self):
+        row = ctk.CTkFrame(self.match_rows, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        combo_a, combo_b = self._pair_combos(row, width=175)
+        entry = (row, combo_a, combo_b)
+        ctk.CTkButton(row, text="✕", width=28, fg_color=("gray65", "gray35"),
+                      hover_color=("gray55", "gray45"),
+                      command=lambda: self._remove_match_pair(entry)).pack(side="left", padx=(6, 0))
+        self.match_pairs.append(entry)
+
+    def _remove_match_pair(self, entry):
+        self.match_pairs.remove(entry)
+        entry[0].destroy()
+
+    def _toggle_setup(self):
+        if self.setup.winfo_manager():
+            self.setup.pack_forget()
+            self.setup_toggle.configure(text="Show setup ▼")
+        else:
+            self.setup.pack(fill="x", padx=4, pady=(0, 4), after=self.setup_toggle.master)
+            self.setup_toggle.configure(text="Hide setup ▲")
+
+    def _selected_column(self, combo, df):
+        value = combo.get().strip()
+        return value if df is not None and value in df.columns else None
+
+    def _reset_compare_pairs(self):
+        if self.df_a is None or self.df_b is None:
+            self.compare_pairs = []
+        else:
+            common = [column for column in self.df_a.columns if column in self.df_b.columns]
+            self.compare_pairs = [[column, column, False] for column in common]
+        self._render_compare_pairs()
+
+    def _shown_pairs(self):
+        text = self.pair_filter.get().strip().casefold()
+        return [pair for pair in self.compare_pairs
+                if not text or text in pair[0].casefold() or text in pair[1].casefold()]
+
+    def _render_compare_pairs(self):
+        self.pair_tree.delete(*self.pair_tree.get_children())
+        for pair in self._shown_pairs():
+            index = self.compare_pairs.index(pair)
+            self.pair_tree.insert("", "end", iid=str(index), tags=("on",) if pair[2] else (),
+                                  values=("☑" if pair[2] else "☐", pair[0], pair[1]))
+        selected = sum(1 for pair in self.compare_pairs if pair[2])
+        self.compare_count.configure(
+            text=f"{selected} selected of {len(self.compare_pairs)}" if self.compare_pairs else
+            "choose both files first")
+
+    def _toggle_pair(self, event):
+        row_id = self.pair_tree.identify_row(event.y)
+        if row_id:
+            pair = self.compare_pairs[int(row_id)]
+            pair[2] = not pair[2]
+            self._render_compare_pairs()
+
+    def _select_shown_pairs(self, selected):
+        for pair in self._shown_pairs():
+            pair[2] = selected
+        self._render_compare_pairs()
+
+    def _add_compare_pair(self):
+        column_a = self._selected_column(self.extra_a, self.df_a)
+        column_b = self._selected_column(self.extra_b, self.df_b)
+        if not column_a or not column_b:
+            messagebox.showwarning("Choose two columns", "Pick one column from file A and one from file B.")
+            return
+        for pair in self.compare_pairs:
+            if pair[0] == column_a and pair[1] == column_b:
+                pair[2] = True
+                break
+        else:
+            self.compare_pairs.insert(0, [column_a, column_b, True])
+        self.pair_filter.delete(0, "end")
+        self._render_compare_pairs()
+
+    # -- files -------------------------------------------------------------
 
     def on_choose_file(self, which):
         path = filedialog.askopenfilename(
@@ -4247,80 +4453,175 @@ class CompareDocumentsPage(ctk.CTkFrame):
         if not path:
             return
         try:
-            df = core.read_records_file(path).reset_index(drop=True)
+            # Keep cells as literal text so 12 isn't read back as 12.0.
+            df = core.read_records_file(path, as_text=True).reset_index(drop=True)
         except Exception as exc:
             messagebox.showerror("Couldn't read file", f"Failed to read this file:\n{exc}")
             return
-        columns = list(df.columns)
+        self.load_dataframe(which, df, os.path.basename(path))
+
+    def load_dataframe(self, which, df, name):
+        columns = [NO_COLUMN] + list(df.columns)
+        guess = abstract_tools.guess_column(list(df.columns), core.TITLE_ALIASES) or NO_COLUMN
         if which == "a":
-            self.df_a, self.path_a = df, path
-            self.label_a.configure(text=f"{os.path.basename(path)} ({len(df):,} records)")
-            menus = (self.title_a, self.doi_a, self.year_a)
+            self.df_a = df
+            self.label_a.configure(text=f"A: {name} ({len(df):,} records)")
+            combos = [self.title_a, self.extra_a] + [entry[1] for entry in self.match_pairs]
         else:
-            self.df_b, self.path_b = df, path
-            self.label_b.configure(text=f"{os.path.basename(path)} ({len(df):,} records)")
-            menus = (self.title_b, self.doi_b, self.year_b)
-        for menu, aliases in zip(menus, (core.TITLE_ALIASES, core.DOI_ALIASES, core.YEAR_ALIASES)):
-            menu.configure(values=[NO_COLUMN] + columns)
-            menu.set(abstract_tools.guess_column(columns, aliases) or NO_COLUMN)
-        self.compare_btn.configure(state="normal" if self.df_a is not None and self.df_b is not None else "disabled")
-        self.export_btn.configure(state="disabled")
-        self.table.set_rows([])
+            self.df_b = df
+            self.label_b.configure(text=f"B: {name} ({len(df):,} records)")
+            combos = [self.title_b, self.extra_b] + [entry[2] for entry in self.match_pairs]
+        for combo in combos:
+            _update_combobox_values(combo, columns)
+            if combo.get() not in columns:
+                combo.set(NO_COLUMN)
+        combos[0].set(guess)
+        self._reset_compare_pairs()
+        self.summary = None
+        self.status_filter.configure(values=[self.ALL_FILTER])
+        self.status_filter.set(self.ALL_FILTER)
+        self.column_filter.configure(values=[self.ANY_COLUMN])
+        self.column_filter.set(self.ANY_COLUMN)
+        ready = self.df_a is not None and self.df_b is not None
+        self.compare_btn.configure(state="normal" if ready else "disabled")
+        self.records, self.visible_records = [], []
+        self._render_results()
+
+    # -- comparison ----------------------------------------------------------
 
     def on_compare(self):
         if self.df_a is None or self.df_b is None:
             return
-        title_a = None if self.title_a.get() == NO_COLUMN else self.title_a.get()
-        doi_a = None if self.doi_a.get() == NO_COLUMN else self.doi_a.get()
-        year_a = None if self.year_a.get() == NO_COLUMN else self.year_a.get()
-        title_b = None if self.title_b.get() == NO_COLUMN else self.title_b.get()
-        doi_b = None if self.doi_b.get() == NO_COLUMN else self.doi_b.get()
-        year_b = None if self.year_b.get() == NO_COLUMN else self.year_b.get()
-        if not title_a or not title_b:
-            messagebox.showwarning(
-                "Choose a title column", "Pick a Title column for both files — it's used to "
-                                        "identify records and as a fallback match key when a "
-                                        "record has no DOI.")
+        title_pair = (self._selected_column(self.title_a, self.df_a),
+                      self._selected_column(self.title_b, self.df_b))
+        if not all(title_pair):
+            messagebox.showwarning("Choose the title columns",
+                                   "Title is required for matching: pick the title column in both files.")
             return
-        self.changes, summary = compare_tools.compare_dataframes(
-            self.df_a, self.df_b, doi_column_a=doi_a, title_column_a=title_a, year_column_a=year_a,
-            doi_column_b=doi_b, title_column_b=title_b, year_column_b=year_b)
-        self._show_summary(summary)
-        rows = [(c["status"], c["title"][:100], c["field"], c["old_value"][:200], c["new_value"][:200])
-                for c in self.changes[:2000]]
-        self.table.set_rows(rows)
-        self.export_btn.configure(state="normal" if self.changes else "disabled")
+        match_pairs = []
+        for _row, combo_a, combo_b in self.match_pairs:
+            pair = (self._selected_column(combo_a, self.df_a), self._selected_column(combo_b, self.df_b))
+            if all(pair):
+                match_pairs.append(pair)
+            elif any(pair):
+                messagebox.showwarning("Incomplete match column",
+                                       "Each extra match column needs a column from both files (or remove it).")
+                return
+        compare_pairs = [(a, b) for a, b, selected in self.compare_pairs if selected]
+        if not compare_pairs:
+            messagebox.showwarning("Choose columns to compare",
+                                   "Tick at least one column pair under “2. Columns to compare”.")
+            return
+        self.used_title_pair, self.used_match_pairs = title_pair, match_pairs
+        self.records, self.summary = compare_tools.compare_by_column_pairs(
+            self.df_a, self.df_b, title_pair, match_pairs, compare_pairs,
+            ignore_case=bool(self.ignore_case_var.get()))
+        counts = self.summary["status_counts"]
+        self.status_filter.configure(values=[f"{self.ALL_FILTER} ({len(self.records):,})"] + [
+            f"{status} ({counts[status]:,})" for status in compare_tools.STATUS_ORDER if counts[status]])
+        self.status_filter.set(
+            f"{compare_tools.DIFFERENT} ({counts[compare_tools.DIFFERENT]:,})"
+            if counts[compare_tools.DIFFERENT] else f"{self.ALL_FILTER} ({len(self.records):,})")
+        field_counts = self.summary["field_difference_counts"]
+        self.column_filter.configure(values=[self.ANY_COLUMN] + [
+            f"{label} ({count:,})" for label, count in
+            sorted(field_counts.items(), key=lambda item: -item[1]) if count])
+        self.column_filter.set(self.ANY_COLUMN)
+        matched = counts[compare_tools.SAME] + counts[compare_tools.DIFFERENT]
+        self.status_var.set(
+            f"Matched {matched:,} records ({counts[compare_tools.DIFFERENT]:,} with differences, "
+            f"{counts[compare_tools.SAME]:,} identical in the compared columns) · "
+            f"{counts[compare_tools.ONLY_A]:,} only in A · {counts[compare_tools.ONLY_B]:,} only in B"
+            + (f" · {counts[compare_tools.NO_TITLE]:,} without a title" if counts[compare_tools.NO_TITLE] else "")
+            + f" · compared {len(compare_pairs)} column(s).")
+        self._build_results_table(self.summary["compared_labels"])
+        self._render_results()
+        if self.setup.winfo_manager():
+            self._toggle_setup()  # give the results the room; "Show setup" brings it back
 
-    def _show_summary(self, summary):
-        lines = [
-            f"File A: {summary['records in file A']:,} records · "
-            f"File B: {summary['records in file B']:,} records",
-            f"Matched: {summary['matched records']:,} · "
-            f"Only in A (removed): {summary['records only in file A (removed)']:,} · "
-            f"Only in B (added): {summary['records only in file B (added)']:,} · "
-            f"Changed: {summary['matched records with a changed field']:,}",
-            f"Compared {summary['common columns compared']:,} columns present in both files.",
-        ]
-        if summary["columns only in file A"]:
-            lines.append("Columns only in file A (not compared): " + ", ".join(summary["columns only in file A"]))
-        if summary["columns only in file B"]:
-            lines.append("Columns only in file B (not compared): " + ", ".join(summary["columns only in file B"]))
-        if summary["duplicate keys ignored in file A"] or summary["duplicate keys ignored in file B"]:
-            lines.append(
-                f"Ignored {summary['duplicate keys ignored in file A']:,} duplicate-key record(s) in "
-                f"file A and {summary['duplicate keys ignored in file B']:,} in file B (same DOI/title "
-                f"appeared more than once, so they can't be matched unambiguously).")
-        if len(self.changes) > 2000:
-            lines.append(f"Showing the first 2,000 of {len(self.changes):,} differences — export for the full list.")
-        _set_readonly_text(self.stats_box, "\n".join(lines))
+    def _configure_status_tags(self, tree):
+        dark = ctk.get_appearance_mode() == "Dark"
+        for status, (light, dark_color) in self.STATUS_COLORS.items():
+            tree.tag_configure(status, background=dark_color if dark else light)
+        tree.tag_configure("key", foreground=_TREEVIEW_COLORS["accent"])
+
+    def _build_results_table(self, labels):
+        if self.table is not None:
+            self.table.destroy()
+        headers = ["Status", "Title", "Differing columns"] + [f"{label}  (A → B)" for label in labels]
+        self.table = ResultsTable(self.results_holder, headers=headers,
+                                  weights=[0, 3, 1] + [2] * len(labels), on_select=self._show_detail)
+        self.table.tree.column("c0", width=95, stretch=False)
+        self.table.tree.column("c1", width=360, stretch=False)
+        for position in range(3, len(headers)):
+            self.table.tree.column(f"c{position}", width=380, stretch=False)
+        self._configure_status_tags(self.table.tree)
+        self.table.pack(fill="both", expand=True)
+
+    def _filtered_records(self):
+        status = self.status_filter.get().rsplit(" (", 1)[0]
+        column = self.column_filter.get()
+        column = None if column == self.ANY_COLUMN else column.rsplit(" (", 1)[0]
+        text = self.title_search.get().strip().casefold()
+        return [record for record in self.records
+                if (status == self.ALL_FILTER or record["status"] == status)
+                and (column is None or column in record["differences"])
+                and (not text or text in record["title"].casefold())]
+
+    def _render_results(self):
+        self.visible_records = self._filtered_records()
+        labels = self.summary["compared_labels"] if self.summary and self.records else []
+        rows, full = [], []
+        for record in self.visible_records:
+            cells_full, cells = [], []
+            for label in labels:
+                value_a, value_b, differs = record["values"][label]
+                text = f"{value_a or '(empty)'}  →  {value_b or '(empty)'}" if differs else ""
+                cells_full.append(text)
+                cells.append(text if len(text) <= 160 else text[:157] + "…")
+            base = [record["status"], record["title"], ", ".join(record["differences"])]
+            rows.append(base[:1] + [base[1][:150]] + base[2:] + cells)
+            full.append(base + cells_full)
+        self.table.set_rows(rows, copy_values=full,
+                            row_tags=[record["status"] for record in self.visible_records])
+        self.export_btn.configure(state="normal" if self.visible_records else "disabled")
+        self.detail_table.set_rows([])
+        self.detail_label.configure(
+            text=f"Showing {len(self.visible_records):,} of {len(self.records):,} records — select one to see "
+                 "both files side by side." if self.records else
+                 "Select a record to see both files side by side.")
+
+    def _show_detail(self, index):
+        if index >= len(self.visible_records):
+            return
+        record = self.visible_records[index]
+        row_a = self.df_a.loc[record["index_a"]] if record["index_a"] is not None else None
+        row_b = self.df_b.loc[record["index_b"]] if record["index_b"] is not None else None
+        where = []
+        if row_a is not None:
+            where.append(f"row {record['index_a'] + 2} in A")
+        if row_b is not None:
+            where.append(f"row {record['index_b'] + 2} in B")
+        note = f" · matched by {record['match_note']}" if record["match_note"] and row_a is not None \
+            and row_b is not None else (f" · {record['match_note']}" if record["match_note"] else "")
+        self.detail_label.configure(text=f"{record['status']} · {' ↔ '.join(where)}{note}")
+        rows, tags = [], []
+        for column_a, column_b in [self.used_title_pair] + list(self.used_match_pairs):
+            value_a = compare_tools._clean(row_a.get(column_a, "")) if row_a is not None else ""
+            value_b = compare_tools._clean(row_b.get(column_b, "")) if row_b is not None else ""
+            rows.append((f"{compare_tools.pair_label(column_a, column_b)}  (match key)", value_a, value_b))
+            tags.append("key")
+        for label in self.summary["compared_labels"]:
+            value_a, value_b, differs = record["values"][label]
+            rows.append((label, value_a, value_b))
+            tags.append(compare_tools.DIFFERENT if differs else "plain")
+        self.detail_table.set_rows(rows, row_tags=tags)
 
     def on_export(self):
-        if self.changes:
-            _export_table_rows(
-                self, [(c["status"], c["key"], c["title"], c["field"], c["old_value"], c["new_value"])
-                       for c in self.changes],
-                ["Status", "Match key", "Title", "Field", "Old value", "New value"],
-                "comparison_differences.csv")
+        if self.visible_records:
+            headers, rows = compare_tools.comparison_export_rows(
+                self.visible_records, self.summary["compared_labels"])
+            _export_table_rows(self, rows, headers, "comparison.csv")
 
 
 # ---------------------------------------------------------------------------

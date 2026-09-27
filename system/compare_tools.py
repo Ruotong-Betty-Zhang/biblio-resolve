@@ -167,3 +167,191 @@ def compare_dataframes(df_a, df_b, doi_column_a=None, title_column_a=None, year_
         "common columns compared": len(common_columns),
     }
     return changes, summary
+
+
+# ---------------------------------------------------------------------------
+# Column-pair comparison (Compare Documents page)
+# ---------------------------------------------------------------------------
+# The user chooses which column pairs identify a record (Title is required,
+# others optional) and which column pairs to compare. Column names may differ
+# between the two files, so everything is expressed as (column in A, column
+# in B) pairs.
+
+SAME = "Same"
+DIFFERENT = "Different"
+ONLY_A = "Only in A"
+ONLY_B = "Only in B"
+NO_TITLE = "No title"
+STATUS_ORDER = (DIFFERENT, SAME, ONLY_A, ONLY_B, NO_TITLE)
+
+_FLOAT_INTEGER_RE = re.compile(r"^-?\d+\.0+$")
+
+
+def _clean(value):
+    text = re.sub(r"\s+", " ", abstract_tools.clean_value(value)).strip()
+    # 1999 and 1999.0 are the same year; spreadsheet exports disagree on it.
+    return text[:text.index(".")] if _FLOAT_INTEGER_RE.match(text) else text
+
+
+def normalize_match_value(value):
+    """Loose key for an extra match column: a DOI in any spelling (URL form,
+    doi: prefix, case) or otherwise case/punctuation-insensitive text."""
+    text = _clean(value)
+    if not text:
+        return ""
+    doi = core.normalize_doi(text)
+    if doi and doi.startswith("10."):
+        return "doi:" + doi.casefold()
+    return normalize_title_key(text)
+
+
+def pair_label(column_a, column_b):
+    return column_a if column_a == column_b else f"{column_a} ↔ {column_b}"
+
+
+def compare_by_column_pairs(df_a, df_b, title_pair, extra_match_pairs=(), compare_pairs=(),
+                            ignore_case=False):
+    """Match records of two tables and diff the chosen column pairs.
+
+    Matching: a record in B is a candidate for a record in A when their
+    normalized titles are equal. Each extra match pair must then agree
+    *where both records have a value* - an empty cell on either side is
+    ignored, so a missing DOI or year never prevents a match. Among several
+    candidates the one agreeing on the most extra columns wins; remaining
+    ties (true duplicates) are paired in file order. Every record is used
+    at most once.
+
+    ``ignore_case`` compares values case- and punctuation-insensitively;
+    otherwise only surrounding/repeated whitespace is ignored. Columns that
+    hold semicolon-separated tags are compared as sets.
+
+    Returns (records, summary). Each record is a dict with ``status`` (one
+    of STATUS_ORDER), ``index_a``/``index_b`` (None when absent), ``title``,
+    ``match_note``, ``differences`` (list of pair labels that differ) and
+    ``values`` {pair label: (value in A, value in B, differs)}.
+    """
+    title_a, title_b = title_pair
+    labels = [pair_label(a, b) for a, b in compare_pairs]
+    kinds = {}
+    for (column_a, column_b), label in zip(compare_pairs, labels):
+        kinds[label] = stats_tools.classify_column(
+            pd.concat([df_a[column_a], df_b[column_b]], ignore_index=True), label)
+
+    def row_keys(df, title_column, extra_columns):
+        keys = []
+        for _index, row in df.iterrows():
+            keys.append((normalize_title_key(row.get(title_column, "")),
+                         [normalize_match_value(row.get(column, "")) for column in extra_columns]))
+        return keys
+
+    keys_a = row_keys(df_a, title_a, [a for a, _b in extra_match_pairs])
+    keys_b = row_keys(df_b, title_b, [b for _a, b in extra_match_pairs])
+    b_by_title = {}
+    for position, (title_key, _extras) in enumerate(keys_b):
+        if title_key:
+            b_by_title.setdefault(title_key, []).append(position)
+
+    used_b, pairs = set(), []  # pairs: (position in A, position in B or None, note)
+    for position_a, (title_key, extras_a) in enumerate(keys_a):
+        if not title_key:
+            pairs.append((position_a, None, "no title in file A"))
+            continue
+        best, best_score, tied = None, -1, 0
+        for position_b in b_by_title.get(title_key, ()):
+            if position_b in used_b:
+                continue
+            extras_b = keys_b[position_b][1]
+            agree, conflict = 0, False
+            for value_a, value_b in zip(extras_a, extras_b):
+                if value_a and value_b:
+                    if value_a == value_b:
+                        agree += 1
+                    else:
+                        conflict = True
+                        break
+            if conflict:
+                continue
+            if agree > best_score:
+                best, best_score, tied = position_b, agree, 1
+            elif agree == best_score:
+                tied += 1
+        if best is None:
+            pairs.append((position_a, None, ""))
+            continue
+        used_b.add(best)
+        checked = sum(1 for value_a, value_b in zip(extras_a, keys_b[best][1]) if value_a and value_b)
+        note = f"title + {best_score} of {len(extra_match_pairs)} extra key(s)" if extra_match_pairs else "title"
+        if extra_match_pairs and checked < len(extra_match_pairs):
+            note += " (others empty)"
+        if tied > 1:
+            note += f"; {tied} identical candidates, paired in file order"
+        pairs.append((position_a, best, note))
+
+    def compare_values(label, value_a, value_b):
+        if kinds[label] == "multi_tag":
+            return set(stats_tools.split_tags(value_a)) != set(stats_tools.split_tags(value_b))
+        if ignore_case:
+            return normalize_title_key(value_a) != normalize_title_key(value_b)
+        return value_a != value_b
+
+    records = []
+    for position_a, position_b, note in pairs:
+        row_a = df_a.iloc[position_a]
+        row_b = df_b.iloc[position_b] if position_b is not None else None
+        title = _clean(row_a.get(title_a, "")) or (_clean(row_b.get(title_b, "")) if row_b is not None else "")
+        values, differences = {}, []
+        for (column_a, column_b), label in zip(compare_pairs, labels):
+            value_a = _clean(row_a.get(column_a, ""))
+            value_b = _clean(row_b.get(column_b, "")) if row_b is not None else ""
+            differs = row_b is not None and bool(value_a or value_b) and compare_values(label, value_a, value_b)
+            values[label] = (value_a, value_b, differs)
+            if differs:
+                differences.append(label)
+        if row_b is None:
+            status = NO_TITLE if note.startswith("no title") else ONLY_A
+        else:
+            status = DIFFERENT if differences else SAME
+        records.append({"status": status, "index_a": df_a.index[position_a],
+                        "index_b": df_b.index[position_b] if position_b is not None else None,
+                        "title": title, "match_note": note,
+                        "differences": differences, "values": values})
+    for position_b, (title_key, _extras) in enumerate(keys_b):
+        if position_b in used_b:
+            continue
+        row_b = df_b.iloc[position_b]
+        values = {label: ("", _clean(row_b.get(column_b, "")), False)
+                  for (_column_a, column_b), label in zip(compare_pairs, labels)}
+        records.append({"status": ONLY_B if title_key else NO_TITLE, "index_a": None,
+                        "index_b": df_b.index[position_b], "title": _clean(row_b.get(title_b, "")),
+                        "match_note": "" if title_key else "no title in file B",
+                        "differences": [], "values": values})
+
+    status_counts = {status: 0 for status in STATUS_ORDER}
+    field_counts = {label: 0 for label in labels}
+    for record in records:
+        status_counts[record["status"]] += 1
+        for label in record["differences"]:
+            field_counts[label] += 1
+    summary = {"records_a": len(df_a), "records_b": len(df_b),
+               "status_counts": status_counts, "field_difference_counts": field_counts,
+               "compared_labels": labels}
+    return records, summary
+
+
+def comparison_export_rows(records, labels):
+    """Wide table for export: one row per record, A/B values side by side.
+    Row numbers are spreadsheet rows (header = row 1)."""
+    headers = ["Status", "Match note", "Row in A", "Row in B", "Title", "Differing columns"]
+    for label in labels:
+        headers += [f"{label} [A]", f"{label} [B]", f"{label} differs"]
+    rows = []
+    for record in records:
+        row = [record["status"], record["match_note"],
+               "" if record["index_a"] is None else record["index_a"] + 2,
+               "" if record["index_b"] is None else record["index_b"] + 2,
+               record["title"], "; ".join(record["differences"])]
+        for label in labels:
+            value_a, value_b, differs = record["values"][label]
+            row += [value_a, value_b, "yes" if differs else ""]
+        rows.append(row)
+    return headers, rows
