@@ -10,37 +10,46 @@ without a technical background. Main workflow tabs include:
    auto-detect the title/author/year columns, run the lookup on all of
    them, and export the enriched records in any of those Zotero-compatible
    formats. DOI and URL results use the standard fields Zotero recognizes.
-3. **Sources** — pick which of 12 free databases to query (Crossref,
-   OpenAlex, Semantic Scholar, DataCite, OpenAIRE, GESIS, CORE, DNB, HAL,
-   CiNii, arXiv, PubMed), and optionally supply a contact email or API
-   keys that improve some sources' rate limits (CORE requires a key to
-   return anything at all). Your selection and keys are saved automatically
-   (`app_settings.json`, next to this script) and restored next time you
-   open the app — no need to reconfigure every session.
-4. **Verification** — independently import a Zotero-compatible file that
+   Its **Sources settings** sub-tab picks which free databases to query
+   (Crossref, OpenAlex, Semantic Scholar, DataCite, OpenAIRE, GESIS, CORE,
+   DNB, HAL, CiNii, arXiv, PubMed, …), and optionally takes a contact email
+   or API keys that improve some sources' rate limits (CORE requires a key
+   to return anything at all). The same selection is used by Single Lookup,
+   Verification and Abstract Finder. Your selection and keys are saved
+   automatically (`app_settings.json`, next to this script) and restored
+   next time you open the app — no need to reconfigure every session.
+3. **Verification** — independently import a Zotero-compatible file that
    already contains titles and DOI/URL values, map the five relevant fields,
    batch-verify every record, and export the verification report. No lookup
    or other preceding task is required. DOI registries/web metadata provide
-   the first verification layer; databases enabled on the **Sources** tab
-   then cross-check the same DOI or canonical URL. A merely similar title
-   with a different identifier is not accepted as verification.
+   the first verification layer; databases enabled under **Batch Import →
+   Sources settings** then cross-check the same DOI or canonical URL. A
+   merely similar title with a different identifier is not accepted as
+   verification. Its **Verification settings** sub-tab chooses which
+   metadata fields (authors, publisher, item type, year, …) are compared.
 
-5. **Abstract Finder** — map title, author, year, URL, DOI, and Abstract fields,
+4. **Abstract Finder** — map title, author, year, URL, DOI, and Abstract fields,
    then fill missing abstracts from the existing URL (or DOI URL when no URL is
    present). A found abstract is always retained. Page/PDF title, author, year,
    and DOI evidence is compared with the input record and written to dedicated
    evidence columns for later review. Possible mismatches receive the portable
    Zotero tag `ABSTRACT_FOUND_POSSIBLE_MISMATCH`; insufficient identity evidence
    receives `ABSTRACT_FOUND_NEEDS_REVIEW`.
-6. **Note Link Recovery** — recover the first HTTP(S) URL from Notes only for
+5. **Note Link Recovery** — recover the first HTTP(S) URL from Notes only for
    records that currently have neither a URL nor a DOI.
-7. **Keyword Cleanup** — retain user-authored uppercase keywords while removing
+6. **Keyword Cleanup** — retain user-authored uppercase keywords while removing
    imported lowercase terms.
-8. **Manual Review** — open a previously exported result without making any
+7. **Manual Review** — open a previously exported result without making any
    API requests. Choose exactly which columns are visible (Title, Year,
    Author, DOI, and URL are selected automatically), click DOI/URL values,
    record a decision and notes, add custom fields, and save a reviewed CSV or
    Excel copy. The source file is not overwritten automatically.
+8. **File Converter** — convert a CSV, RIS, or BibTeX file into either of the
+   other two formats. Tick the columns to keep, optionally filter records
+   (text or numeric conditions combined with AND/OR), preview, and save.
+   Values are copied verbatim (no `12` → `12.0`). Kept columns that RIS or
+   BibTeX have no tag for are stored in the record Note and restored when the
+   file is read back by this app, so conversions round-trip without loss.
 
 Abstract identity checking is advisory and deliberately separate from abstract
 retention. `Abstract Match Status` is `matched`, `possible_mismatch`, or

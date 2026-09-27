@@ -3,17 +3,19 @@ literature_lookup.py
 ---------------------
 Literature DOI / link lookup tool.
 
-Five tabs:
+Main tabs include:
 1. "Single Lookup": type in one title (author/year optional) and search.
 2. "Batch Import": pick a CSV exported from Zotero, RIS, BibTeX/BibLaTeX, CSL JSON, or
    Excel file, auto-detect which fields hold title/author/year, run the
    lookup on all of them, then export a Zotero-compatible result file.
-3. "Sources": pick which of the 12 free databases to query, and optionally
-   supply a contact email / API keys that improve some sources' rate
-   limits (or, for CORE, are required for it to return anything at all).
-4. "Verification": independently import an existing bibliographic file and
-   batch-check its DOI/URL records without running lookup first.
-5. "Manual Review": open an existing result file, display only selected
+   Its "Sources settings" sub-tab picks which free databases to query, and
+   optionally takes a contact email / API keys that improve some sources'
+   rate limits (or, for CORE, are required for it to return anything at all).
+   These sources are shared by every tab that searches.
+3. "Verification": independently import an existing bibliographic file and
+   batch-check its DOI/URL records without running lookup first. Its
+   "Verification settings" sub-tab chooses which metadata fields are compared.
+4. "Manual Review": open an existing result file, display only selected
    columns, click DOI/URL links, and save human decisions without API calls.
 
 The actual query/scoring logic (Crossref, OpenAlex, Semantic Scholar,
@@ -605,6 +607,20 @@ class ResultsTable(ctk.CTkFrame):
 # Main window
 # ---------------------------------------------------------------------------
 
+BATCH_RUN_SUBTAB = "Batch Lookup"
+SOURCES_SUBTAB = "Sources settings"
+VERIFY_RUN_SUBTAB = "Verify file"
+VERIFICATION_SETTINGS_SUBTAB = "Verification settings"
+SOURCES_LOCATION = f"Batch Import → {SOURCES_SUBTAB}"
+
+
+def _settings_subtabs(parent):
+    """A compact tab strip inside a main tab: the task, then its settings."""
+    subtabs = ctk.CTkTabview(parent, corner_radius=8, border_width=0, fg_color="transparent",
+                             segmented_button_font=ctk.CTkFont(size=12))
+    subtabs.pack(fill="both", expand=True)
+    return subtabs
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -619,7 +635,6 @@ class App(ctk.CTk):
         single_tab = tabview.add("Single Lookup")
         batch_tab = tabview.add("Batch Import")
         verification_tab = tabview.add("Verification")
-        verification_settings_tab = tabview.add("Verification Settings")
         abstract_tab = tabview.add("Abstract Finder")
         issp_module_tab = tabview.add("ISSP Module Tags")
         note_links_tab = tabview.add("Note Link Recovery")
@@ -628,8 +643,21 @@ class App(ctk.CTk):
         statistics_tab = tabview.add("Statistics")
         compare_tab = tabview.add("Compare Documents")
         translate_tab = tabview.add("Translate")
-        sources_tab = tabview.add("Sources")
+        convert_tab = tabview.add("File Converter")
         tabview.set("Single Lookup")
+
+        # Source selection lives under Batch Import and the verification
+        # method under Verification, as sub-tabs. The settings objects are
+        # still shared: Single Lookup, Abstract Finder and Verification read
+        # the same sources, and Single Lookup the same verification fields.
+        batch_subtabs = _settings_subtabs(batch_tab)
+        batch_run_tab = batch_subtabs.add(BATCH_RUN_SUBTAB)
+        sources_tab = batch_subtabs.add(SOURCES_SUBTAB)
+        batch_subtabs.set(BATCH_RUN_SUBTAB)
+        verification_subtabs = _settings_subtabs(verification_tab)
+        verification_run_tab = verification_subtabs.add(VERIFY_RUN_SUBTAB)
+        verification_settings_tab = verification_subtabs.add(VERIFICATION_SETTINGS_SUBTAB)
+        verification_subtabs.set(VERIFY_RUN_SUBTAB)
 
         self.sources_page = SourcesPage(sources_tab)
         self.sources_page.pack(fill="both", expand=True)
@@ -652,11 +680,11 @@ class App(ctk.CTk):
         self.single_page = SingleLookupPage(single_tab, self.sources_page, self.verification_settings_page)
         self.single_page.pack(fill="both", expand=True)
 
-        self.batch_page = BatchLookupPage(batch_tab, self.sources_page)
+        self.batch_page = BatchLookupPage(batch_run_tab, self.sources_page)
         self.batch_page.pack(fill="both", expand=True)
 
         self.verification_page = VerificationPage(
-            verification_tab, self.sources_page, self.verification_settings_page)
+            verification_run_tab, self.sources_page, self.verification_settings_page)
         self.verification_page.pack(fill="both", expand=True)
 
         self.review_page = ManualReviewPage(review_tab)
@@ -670,6 +698,9 @@ class App(ctk.CTk):
 
         self.translate_page = TranslatePage(translate_tab)
         self.translate_page.pack(fill="both", expand=True)
+
+        self.convert_page = FileConverterPage(convert_tab)
+        self.convert_page.pack(fill="both", expand=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2916,7 +2947,7 @@ class SingleLookupPage(ctk.CTkFrame):
         self.year_entry.pack(side="left")
         self.year_entry.bind("<Return>", lambda e: self.on_search())
 
-        self.status_var = ctk.StringVar(value="Enter a title and click “Search”. Pick which sources to use on the Sources tab.")
+        self.status_var = ctk.StringVar(value=f"Enter a title and click “Search”. Pick which sources to use under {SOURCES_LOCATION}.")
         ctk.CTkLabel(self, textvariable=self.status_var, text_color=("gray30", "gray70"), anchor="w") \
             .pack(fill="x", padx=4, pady=(0, 8))
 
@@ -2960,7 +2991,7 @@ class SingleLookupPage(ctk.CTkFrame):
 
         enabled_sources = self.sources_page.get_enabled_sources()
         if not enabled_sources:
-            messagebox.showwarning("No sources selected", "Please enable at least one source on the Sources tab.")
+            messagebox.showwarning("No sources selected", f"Please enable at least one source under {SOURCES_LOCATION}.")
             return
 
         self.table.set_rows([])
@@ -3155,7 +3186,8 @@ class VerificationPage(ctk.CTkFrame):
         self.progress = ctk.CTkProgressBar(self)
         self.progress.set(0)
         self.progress.pack(fill="x", padx=4, pady=(0, 4))
-        self.status_var = ctk.StringVar(value="Choose a file. Verification uses the databases enabled on the Sources tab.")
+        self.status_var = ctk.StringVar(value=f"Choose a file. Verification uses the databases enabled under {SOURCES_LOCATION}; "
+                  f"choose the compared fields on the {VERIFICATION_SETTINGS_SUBTAB} sub-tab.")
         ctk.CTkLabel(self, textvariable=self.status_var, anchor="w", text_color=("gray30", "gray70")) \
             .pack(fill="x", padx=4, pady=(0, 2))
         self.time_var = ctk.StringVar(value="Elapsed 0:00 · Estimated remaining: waiting to start")
@@ -3742,7 +3774,7 @@ class BatchLookupPage(ctk.CTkFrame):
                      font=ctk.CTkFont(size=11), anchor="w") \
             .pack(fill="x", padx=4, pady=(0, 6))
 
-        self.status_var = ctk.StringVar(value="Choose a file with a list of literature records to get started. Pick which sources to use on the Sources tab.")
+        self.status_var = ctk.StringVar(value=f"Choose a file with a list of literature records to get started. Pick which sources to use on the {SOURCES_SUBTAB} sub-tab.")
         ctk.CTkLabel(self, textvariable=self.status_var, text_color=("gray30", "gray70"), anchor="w") \
             .pack(fill="x", padx=4, pady=(0, 8))
 
@@ -3840,7 +3872,7 @@ class BatchLookupPage(ctk.CTkFrame):
 
         enabled_sources = self.sources_page.get_enabled_sources()
         if not enabled_sources:
-            messagebox.showwarning("No sources selected", "Please enable at least one source on the Sources tab.")
+            messagebox.showwarning("No sources selected", f"Please enable at least one source under {SOURCES_LOCATION}.")
             return
 
         scope = self.scope_var.get()
