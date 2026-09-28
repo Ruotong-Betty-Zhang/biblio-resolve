@@ -68,6 +68,49 @@ class PortableColumnTests(unittest.TestCase):
     def test_csv_needs_no_portable_columns(self):
         self.assertEqual(tools.portable_columns_for(["Module"], "csv"), [])
 
+    def test_exact_name_is_native_when_case_variants_collide(self):
+        # A lookup result file holds the record's own "DOI" and the lookup's "doi".
+        portable = tools.portable_columns_for(["doi", "DOI", "url", "Url"], "ris")
+        self.assertEqual(portable, ["doi", "url"])
+
+
+class BibtexEscapingRoundTripTests(unittest.TestCase):
+    def test_newlines_backslashes_and_braces_survive(self):
+        frame = pd.DataFrame({
+            "Title": ["Paper {with} braces"],
+            "Abstract Note": ["Line one&#13;\\n\\tliteral backslash-n"],
+            "matched_title": ["Welfare States \nCompared"],  # portable: travels in the Note
+        })
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.bib")
+            tools.convert_file(frame, path, "bibtex", list(frame.columns))
+            loaded = core.read_records_file(path, as_text=True)
+        self.assertEqual(loaded.loc[0, "Title"], "Paper {with} braces")
+        self.assertEqual(loaded.loc[0, "Abstract Note"], "Line one&#13;\\n\\tliteral backslash-n")
+        self.assertEqual(loaded.loc[0, "matched_title"], "Welfare States \nCompared")
+
+    def test_latex_accents_in_third_party_files_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "in.bib")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write('@article{k,\n  title = {M{\\"u}ller and Co \\& Partners}\n}\n')
+            loaded = core.read_records_file(path, as_text=True)
+        self.assertEqual(loaded.loc[0, "Title"], 'M{\\"u}ller and Co \\& Partners')
+
+
+class CaseCollisionRoundTripTests(unittest.TestCase):
+    def test_record_doi_written_to_tag_and_lookup_doi_kept_in_note(self):
+        frame = pd.DataFrame({"Title": ["Paper"], "DOI": ["10.1/own"], "doi": ["10.1/lookup"]})
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.ris")
+            tools.convert_file(frame, path, "ris", list(frame.columns))
+            with open(path, encoding="utf-8") as stream:
+                text = stream.read()
+            loaded = core.read_records_file(path, as_text=True)
+        self.assertIn("DO  - 10.1/own", text)
+        self.assertEqual(loaded.loc[0, "DOI"], "10.1/own")
+        self.assertEqual(loaded.loc[0, "doi"], "10.1/lookup")
+
 
 class ConvertRoundTripTests(unittest.TestCase):
     def setUp(self):

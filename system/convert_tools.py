@@ -1,9 +1,9 @@
 """
 convert_tools.py
 ----------------
-Logic for the "File Converter" page: load a CSV / RIS / BibTeX file, keep
-only the chosen columns, filter rows, and write the result in any of those
-three formats.
+Filtering and format-conversion logic used by the "Review & Convert" page
+(which absorbed the former File Converter page): filter rows, keep only the
+chosen columns, and write the result as CSV, RIS or BibTeX.
 
 RIS and BibTeX only have tags for a fixed set of bibliographic fields. Any
 kept column the target format has no tag for is carried as a portable
@@ -109,11 +109,15 @@ def portable_columns_for(columns, fmt):
     groups = NATIVE_FIELD_GROUPS.get(fmt)
     if groups is None:
         return []
-    by_folded = {str(c).strip().casefold(): c for c in columns}
+    by_folded = {}
+    for c in columns:
+        by_folded.setdefault(str(c).strip().casefold(), c)
     native = set()
     for group in groups:
         for alias in group:
-            column = by_folded.get(alias.casefold())
+            # Same rule as lookup_core's writer: an exact name ("DOI") beats a
+            # case-insensitive one ("doi"), which then travels in the Note.
+            column = alias if alias in columns else by_folded.get(alias.casefold())
             if column is not None:
                 native.add(column)
                 break

@@ -15,8 +15,10 @@ Main tabs include:
 3. "Verification": independently import an existing bibliographic file and
    batch-check its DOI/URL records without running lookup first. Its
    "Verification settings" sub-tab chooses which metadata fields are compared.
-4. "Manual Review": open an existing result file, display only selected
-   columns, click DOI/URL links, and save human decisions without API calls.
+4. "Review & Convert": open an existing file (CSV, Excel, RIS, BibTeX, CSL
+   JSON), display only selected columns, filter, click DOI/URL links, record
+   human decisions without API calls, and save all or the filtered records
+   with all or only the ticked columns as CSV, Excel, RIS or BibTeX.
 
 The actual query/scoring logic (Crossref, OpenAlex, Semantic Scholar,
 DataCite, GESIS, arXiv, PubMed, CORE, OpenAIRE, DNB, HAL, CiNii) lives in
@@ -32,6 +34,7 @@ Package it into a .exe a coworker can just double-click:
     pyinstaller --onefile --windowed --name "Literature Lookup" literature_lookup.py
 """
 
+import math
 import os
 import queue
 import re
@@ -315,7 +318,7 @@ class VerificationColumnRemovalDialog(ctk.CTkToplevel):
                 self,
                 text=("This bibliographic format cannot store custom columns natively. Kept Verification "
                       "fields will be carried in each record's Note and restored as columns when this app "
-                      "opens the file in Manual Review."),
+                      "opens the file in Review & Convert."),
                 justify="left", anchor="w", wraplength=630,
                 text_color=("#8a5500", "#f0b35a")).pack(fill="x", padx=18, pady=(0, 7))
 
@@ -639,11 +642,10 @@ class App(ctk.CTk):
         issp_module_tab = tabview.add("ISSP Module Tags")
         note_links_tab = tabview.add("Note Link Recovery")
         tag_cleanup_tab = tabview.add("Keyword Cleanup")
-        review_tab = tabview.add("Manual Review")
+        review_tab = tabview.add("Review & Convert")
         statistics_tab = tabview.add("Statistics")
         compare_tab = tabview.add("Compare Documents")
         translate_tab = tabview.add("Translate")
-        convert_tab = tabview.add("File Converter")
         tabview.set("Single Lookup")
 
         # Source selection lives under Batch Import and the verification
@@ -699,8 +701,6 @@ class App(ctk.CTk):
         self.translate_page = TranslatePage(translate_tab)
         self.translate_page.pack(fill="both", expand=True)
 
-        self.convert_page = FileConverterPage(convert_tab)
-        self.convert_page.pack(fill="both", expand=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1367,7 +1367,7 @@ class IsspModulePage(ctk.CTkFrame):
                     self.export_btn.configure(state="normal")
                     self.status_var.set(
                         f"Classification complete. Tags were written into '{tag_column}'. "
-                        f"Export to save, or open the export in Manual Review to check "
+                        f"Export to save, or open the export in Review & Convert to check "
                         f"low/medium-confidence rows.")
                     self._show_results(stats)
                 elif kind == "error":
@@ -1568,9 +1568,17 @@ class TagCleanupPage(ctk.CTkFrame):
 # Manual review: inspect an existing result file without running APIs
 # ---------------------------------------------------------------------------
 
+_WHOLE_NUMBER_TEXT_RE = re.compile(r"^-?\d+\.0+$")
+
+
 class ManualReviewPage(ctk.CTkFrame):
     """A compact, configurable review view over an already-generated file."""
     PAGE_SIZE = 100
+    EXPORT_FORMATS = {label: value for label, value in core.OUTPUT_FORMATS.items()
+                      if value[0] in {"csv", "excel", "ris", "bibtex"}}
+    ALL_ROWS, FILTERED_ROWS = "All", "Filtered"
+    ALL_COLUMNS, TICKED_COLUMNS = "All", "Ticked only"
+    REVIEW_COLUMNS = ("Manual Decision", "Manual Notes")
     DEFAULT_ALIASES = [
         ("Title", core.TITLE_ALIASES), ("Year", core.YEAR_ALIASES),
         ("Author", core.AUTHOR_ALIASES), ("DOI", core.DOI_ALIASES),
@@ -1599,24 +1607,39 @@ class ManualReviewPage(ctk.CTkFrame):
         self.file_label = ctk.CTkLabel(top, text="No file loaded — this page does not call any API", anchor="w")
         self.file_label.pack(side="left", padx=12, fill="x", expand=True)
 
-        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        # Save / convert (this page absorbed the former File Converter). RIS
+        # and BibTeX have no tag for free-form columns (Manual Decision,
+        # verification metadata, ...); those travel in the record Note and
+        # come back as columns when this app reads the file again. CSL JSON
+        # has no such carrier, so it isn't offered here.
+        export_row = ctk.CTkFrame(self)
         export_row.pack(fill="x", padx=4, pady=(0, 8))
-        ctk.CTkLabel(export_row, text="Export format").pack(side="left", padx=(0, 8))
-        # Manual Review adds free-form extra columns (Manual Decision,
-        # verification metadata, ...) that only a flat table can hold
-        # without loss, so - unlike the other pages - this is CSV/Excel
-        # only, not the full RIS/BibTeX/CSL JSON set.
+        ctk.CTkLabel(export_row, text="Save as", font=ctk.CTkFont(weight="bold")).pack(
+            side="left", padx=(10, 8), pady=8)
         self.output_format = ctk.CTkOptionMenu(
-            export_row, values=["CSV table (.csv)", "Excel (.xlsx)"], width=170)
+            export_row, values=list(self.EXPORT_FORMATS), width=160,
+            command=lambda _value: self._update_export_summary())
         self.output_format.set("CSV table (.csv)")
-        self.output_format.pack(side="left", padx=(0, 10))
-        self.save_btn = ctk.CTkButton(export_row, text="Save reviewed copy…", width=160,
-                                      command=self.on_save, state="disabled")
+        self.output_format.pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(export_row, text="Records").pack(side="left", padx=(0, 6))
+        self.export_rows = ctk.CTkSegmentedButton(
+            export_row, values=[self.ALL_ROWS, self.FILTERED_ROWS],
+            command=lambda _value: self._update_export_summary())
+        self.export_rows.set(self.ALL_ROWS)
+        self.export_rows.pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(export_row, text="Columns").pack(side="left", padx=(0, 6))
+        self.export_columns = ctk.CTkSegmentedButton(
+            export_row, values=[self.ALL_COLUMNS, self.TICKED_COLUMNS],
+            command=lambda _value: self._update_export_summary())
+        self.export_columns.set(self.ALL_COLUMNS)
+        self.export_columns.pack(side="left", padx=(0, 14))
+        self.save_btn = ctk.CTkButton(export_row, text="Save / convert…", width=140,
+                                      command=self.on_export, state="disabled")
         self.save_btn.pack(side="left")
-        self.save_filtered_btn = ctk.CTkButton(
-            export_row, text="Save filtered results…", width=165,
-            command=self.on_save_filtered, state="disabled")
-        self.save_filtered_btn.pack(side="left", padx=(8, 0))
+        self.export_summary = ctk.CTkLabel(
+            export_row, text="", anchor="w", justify="left", text_color=("gray30", "gray70"),
+            font=ctk.CTkFont(size=12))
+        self.export_summary.pack(side="left", padx=12, fill="x", expand=True)
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=4)
@@ -1626,8 +1649,18 @@ class ManualReviewPage(ctk.CTkFrame):
         sidebar = ctk.CTkFrame(body, width=225)
         sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
         sidebar.grid_propagate(False)
-        ctk.CTkLabel(sidebar, text="Columns to display", font=ctk.CTkFont(weight="bold")) \
-            .pack(anchor="w", padx=10, pady=(10, 4))
+        ctk.CTkLabel(sidebar, text="Columns", font=ctk.CTkFont(weight="bold")) \
+            .pack(anchor="w", padx=10, pady=(10, 0))
+        ctk.CTkLabel(sidebar, text="Ticked columns are shown in the table, and are the ones kept "
+                                   "when saving with Columns = Ticked only.",
+                     text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11), anchor="w",
+                     justify="left", wraplength=200).pack(fill="x", padx=10, pady=(0, 4))
+        tick_row = ctk.CTkFrame(sidebar, fg_color="transparent")
+        tick_row.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkButton(tick_row, text="All", width=95, command=lambda: self._set_all_columns(True)) \
+            .pack(side="left", padx=(0, 4))
+        ctk.CTkButton(tick_row, text="None", width=95, command=lambda: self._set_all_columns(False)) \
+            .pack(side="left")
         self.column_box = ctk.CTkScrollableFrame(sidebar, height=270)
         self.column_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         ctk.CTkButton(sidebar, text="Add manual field…", command=self.add_manual_field) \
@@ -1645,9 +1678,9 @@ class ManualReviewPage(ctk.CTkFrame):
         self.filter_operator = ctk.CTkOptionMenu(filters, values=["equals"], width=125)
         self.filter_operator.grid(row=1, column=1, padx=5, pady=(0, 7))
         self.filter_value = _make_searchable_combobox(
-            filters, values=[""], width=260, dropdown_rows=9)
+            filters, values=[""], width=200, dropdown_rows=9)
         self.filter_value.grid(row=1, column=2, padx=5, pady=(0, 7), sticky="w")
-        self.filter_value_to = ctk.CTkEntry(filters, width=105, placeholder_text="Upper value")
+        self.filter_value_to = ctk.CTkEntry(filters, width=95, placeholder_text="Upper value")
         self.filter_value_to.grid(row=1, column=3, padx=5, pady=(0, 7))
         ctk.CTkButton(filters, text="Add another", width=110, command=self.add_filter_condition) \
             .grid(row=1, column=4, padx=5, pady=(0, 7))
@@ -1732,13 +1765,15 @@ class ManualReviewPage(ctk.CTkFrame):
 
     def on_choose_file(self):
         path = filedialog.askopenfilename(
-            title="Choose an existing lookup or verification result",
+            title="Choose a file to review or convert",
             filetypes=[("Supported files", "*.csv *.xlsx *.xls *.json *.ris *.bib *.bibtex"),
-                       ("CSV", "*.csv"), ("Excel", "*.xlsx *.xls"), ("All files", "*.*")])
+                       ("CSV", "*.csv"), ("Excel", "*.xlsx *.xls"), ("RIS", "*.ris"),
+                       ("BibTeX", "*.bib *.bibtex"), ("CSL JSON", "*.json"), ("All files", "*.*")])
         if not path:
             return
         try:
-            df = core.read_records_file(path).reset_index(drop=True)
+            # Literal cell text, so a converted file keeps 12 rather than 12.0.
+            df = core.read_records_file(path, as_text=True).reset_index(drop=True)
         except Exception as exc:
             messagebox.showerror("Couldn't read file", f"Failed to read this file:\n{exc}")
             return
@@ -1760,8 +1795,11 @@ class ManualReviewPage(ctk.CTkFrame):
         encoding_note = f" · {encoding}" if encoding else ""
         self.file_label.configure(text=f"{os.path.basename(path)} ({len(df)} records){encoding_note}")
         self.save_btn.configure(state="normal")
-        self.save_filtered_btn.configure(state="normal")
         self.review_btn.configure(state="normal")
+        # Offer a different format than the source, as a converter would.
+        source_label = core.preferred_output_format_label(path)
+        if source_label in self.EXPORT_FORMATS:
+            self.output_format.set(source_label)
         self._build_column_choices()
         _update_combobox_values(self.filter_column, list(df.columns))
         self.filter_column.set(str(df.columns[0]))
@@ -1867,6 +1905,8 @@ class ManualReviewPage(ctk.CTkFrame):
             messagebox.showerror("Invalid filter", f"The filter could not be applied:\n{exc}")
             return
         self.filtered_indices = self.df.index[mask].tolist()
+        if self.filter_conditions:
+            self.export_rows.set(self.FILTERED_ROWS)  # saving usually means "what I'm looking at"
         self.page, self.selected_df_index = 0, None
         self.apply_btn.configure(state="disabled")
         self._update_filter_summary(True)
@@ -1878,6 +1918,7 @@ class ManualReviewPage(ctk.CTkFrame):
         self._store_selected()
         self.filter_conditions = []
         self.filtered_indices = list(self.df.index)
+        self.export_rows.set(self.ALL_ROWS)
         self.page, self.selected_df_index = 0, None
         self.apply_btn.configure(state="disabled")
         _set_readonly_text(
@@ -1910,7 +1951,10 @@ class ManualReviewPage(ctk.CTkFrame):
         # as floats; show 1999.0 as 1999.
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
-        return str(value)
+        text = str(value)
+        if _WHOLE_NUMBER_TEXT_RE.match(text):
+            return text[:text.index(".")]
+        return text
 
     @staticmethod
     def _doi_link(value):
@@ -1922,9 +1966,15 @@ class ManualReviewPage(ctk.CTkFrame):
     def selected_columns(self):
         return [column for column, var in self.column_vars.items() if var.get()]
 
+    def _set_all_columns(self, selected):
+        for var in self.column_vars.values():
+            var.set(selected)
+        self.render_page()
+
     def render_page(self):
         if self.df is None:
             return
+        self._update_export_summary()
         columns = self.selected_columns()
         if not columns:
             self.page_label.configure(text="Select at least one display column")
@@ -2102,51 +2152,67 @@ class ManualReviewPage(ctk.CTkFrame):
             return
         self.review_window = ManualReviewDialog(self, queue_indices, start_index)
 
-    def on_save(self):
+    def _export_frame(self):
+        """The records and columns the Save / convert settings select."""
+        if self.export_rows.get() == self.FILTERED_ROWS and self.filter_conditions:
+            indices = self.filtered_indices
+        else:
+            indices = list(self.df.index)
+        if self.export_columns.get() == self.TICKED_COLUMNS:
+            columns = self.selected_columns()
+        else:
+            columns = list(self.df.columns)
+        frame = self.df.loc[indices, columns]
+        # Review columns are added to every loaded file; leave them out of a
+        # plain conversion where nobody reviewed anything.
+        unused = [c for c in self.REVIEW_COLUMNS
+                  if c in frame.columns and not frame[c].map(self._display_value).str.strip().any()]
+        return frame.drop(columns=unused).reset_index(drop=True)
+
+    def _update_export_summary(self):
+        if self.df is None or not hasattr(self, "export_summary"):
+            return
+        frame = self._export_frame()
+        fmt, _ext = self.EXPORT_FORMATS[self.output_format.get()]
+        text = f"{len(frame):,} of {len(self.df):,} records × {len(frame.columns)} columns"
+        if self.export_rows.get() == self.FILTERED_ROWS and not self.filter_conditions:
+            text += " (no filter applied)"
+        portable = convert_tools.portable_columns_for(list(frame.columns), fmt)
+        if portable:
+            text += f" · {len(portable)} kept in the record Note"
+        self.export_summary.configure(text=text)
+
+    def on_export(self):
         if self.df is None:
             return
         self._store_selected()
-        self._save_dataframe(
-            self.df, "Save manually reviewed records", "manual_review",
-            "Reviewed copy")
-
-    def on_save_filtered(self):
-        """Save only the records remaining after the current filters are applied."""
-        if self.df is None:
+        frame = self._export_frame()
+        if frame.empty or not len(frame.columns):
+            messagebox.showwarning("Nothing to save",
+                                   "The current record and column choices select nothing to save.")
             return
-        self._store_selected()
-        active_indices = (self.filtered_indices if self.filter_conditions
-                          else list(self.df.index))
-        if not active_indices:
-            messagebox.showwarning(
-                "No filtered records",
-                "The current filters return zero records, so there is nothing to save.")
-            return
-        filtered_df = self.df.loc[active_indices].copy().reset_index(drop=True)
-        self._save_dataframe(
-            filtered_df, "Save filtered review results", "filtered_review",
-            f"Filtered copy ({len(filtered_df)} records)")
-
-    def _save_dataframe(self, dataframe, dialog_title, filename_suffix, saved_label):
+        label = self.output_format.get()
+        fmt, ext = self.EXPORT_FORMATS[label]
         base = os.path.splitext(os.path.basename(self.file_path or "records"))[0]
-        want_excel = self.output_format.get().startswith("Excel")
-        default_ext = ".xlsx" if want_excel else ".csv"
-        filetypes = [("Excel", "*.xlsx"), ("CSV", "*.csv")] if want_excel else [("CSV", "*.csv"), ("Excel", "*.xlsx")]
+        suffix = "filtered" if len(frame) < len(self.df) else "reviewed"
         path = filedialog.asksaveasfilename(
-            title=dialog_title, defaultextension=default_ext,
-            filetypes=filetypes,
-            initialfile=f"{base}_{filename_suffix}{default_ext}")
+            title="Save / convert records", defaultextension=ext,
+            filetypes=[(label, f"*{ext}")], initialfile=f"{base}_{suffix}{ext}")
         if not path:
             return
+        # A typed extension wins over the menu so the content matches the name.
+        typed = os.path.splitext(path)[1].lower().replace(".bibtex", ".bib").replace(".xls", ".xlsx")
+        fmt = next((f for f, e in self.EXPORT_FORMATS.values() if e == typed), fmt)
+        portable = convert_tools.portable_columns_for(list(frame.columns), fmt)
         try:
-            if path.lower().endswith(".xlsx"):
-                dataframe.to_excel(path, index=False)
-            else:
-                dataframe.to_csv(path, index=False, encoding="utf-8-sig")
+            core.write_records_file(frame, path, fmt, portable_columns=portable)
         except Exception as exc:
             messagebox.showerror("Save failed", f"Couldn't save the file:\n{exc}")
             return
-        messagebox.showinfo("Saved", f"{saved_label} saved to:\n{path}")
+        extra = (f"\n{len(portable)} column(s) without a native tag were stored in each record's "
+                 "Note and are restored when this app opens the file." if portable else "")
+        messagebox.showinfo("Saved", f"Saved {len(frame):,} records × {len(frame.columns)} columns to:"
+                                     f"\n{path}{extra}")
 
 
 class ManualReviewDialog(ctk.CTkToplevel):
@@ -2223,8 +2289,10 @@ class ManualReviewDialog(ctk.CTkToplevel):
         self.retrieved_heading.grid(row=0, column=3, sticky="w", padx=5)
 
         self.comparison_frame = ctk.CTkScrollableFrame(self, height=300)
-        self.comparison_frame.grid_columnconfigure(1, weight=1)
-        self.comparison_frame.grid_columnconfigure(3, weight=1)
+        # "uniform" keeps both sides equally wide; otherwise the retrieved
+        # column's width-following wrap slowly squeezes the input column.
+        self.comparison_frame.grid_columnconfigure(1, weight=1, uniform="sides")
+        self.comparison_frame.grid_columnconfigure(3, weight=1, uniform="sides")
         self.all_fields_frame = ctk.CTkScrollableFrame(self, height=300)
         self.all_fields_frame.grid_columnconfigure(1, weight=1)
 
@@ -2361,7 +2429,8 @@ class ManualReviewDialog(ctk.CTkToplevel):
             self.retrieved_heading.grid()
         else:
             self.retrieved_heading.grid_remove()
-        self.comparison_frame.grid_columnconfigure(3, weight=1 if show_compare else 0)
+        self.comparison_frame.grid_columnconfigure(
+            3, weight=1 if show_compare else 0, uniform="sides" if show_compare else "")
         self.comparison_frame.grid_columnconfigure(2, minsize=105 if show_compare else 0)
         editable = bool(self.edit_mode_var.get())
         mode = "editable" if editable else "view only"
@@ -2378,7 +2447,47 @@ class ManualReviewDialog(ctk.CTkToplevel):
 
     @staticmethod
     def _needs_textbox(value):
-        return len(value) > 150 or "\n" in value
+        # Anything longer than roughly one line of the field width wraps in a
+        # textbox; a single-line entry would hide the rest of the value.
+        return len(value) > 45 or "\n" in value
+
+    EDITOR_LINE_HEIGHT = 20
+    EDITOR_MAX_LINES = 10  # longer values (abstracts) scroll inside the box
+
+    def _fit_editor_height(self, widget, value=None):
+        """Size a textbox editor to its wrapped content, estimated from the
+        text length and the widget's current width (no layout pass needed)."""
+        if not isinstance(widget, ctk.CTkTextbox):
+            return
+        if value is None:
+            value = widget.get("1.0", "end-1c")
+        lines = None
+        if widget.winfo_width() > 1:
+            # Laid out: let the text widget count its own wrapped lines.
+            try:
+                counted = widget._textbox.count("1.0", "end", "update", "displaylines")
+                lines = counted[0] if isinstance(counted, (tuple, list)) else counted
+            except Exception:
+                lines = None
+        if not lines:
+            # Not shown yet: estimate; <Configure> re-measures once it is.
+            parent_width = widget.master.winfo_width()
+            width = max(300, parent_width - 130) if parent_width > 1 else 420
+            chars_per_line = max(20, int((width - 20) / 9))
+            lines = sum(max(1, math.ceil(len(part) / chars_per_line)) for part in value.split("\n"))
+        height = min(self.EDITOR_MAX_LINES, max(1, lines)) * self.EDITOR_LINE_HEIGHT + 14
+        if widget.cget("height") != height:
+            widget.configure(height=height)
+
+    def _refit_on_resize(self, widget):
+        """Re-estimate a textbox's height when its width changes."""
+        state = {"width": 0}
+
+        def on_configure(event):
+            if abs(event.width - state["width"]) > 20:
+                state["width"] = event.width
+                self._fit_editor_height(widget)
+        widget.bind("<Configure>", on_configure, add="+")
 
     def _set_editor_value(self, widget, value):
         """Replace an editor's text and apply the current edit/view state."""
@@ -2387,6 +2496,7 @@ class ManualReviewDialog(ctk.CTkToplevel):
         if isinstance(widget, ctk.CTkTextbox):
             widget.delete("1.0", "end")
             widget.insert("1.0", value)
+            self._fit_editor_height(widget, value)
             if not editable:
                 widget.configure(state="disabled")
         else:
@@ -2400,7 +2510,8 @@ class ManualReviewDialog(ctk.CTkToplevel):
         Returns (widget, getter). Outside edit mode the widget is read-only
         (text can still be selected and copied)."""
         if self._needs_textbox(value):
-            widget = ctk.CTkTextbox(parent, height=80, wrap="word", font=ctk.CTkFont(size=13))
+            widget = ctk.CTkTextbox(parent, height=34, wrap="word", font=ctk.CTkFont(size=13))
+            self._refit_on_resize(widget)
             getter = lambda w=widget: w.get("1.0", "end-1c").strip()
         else:
             widget = ctk.CTkEntry(parent) if width is None else ctk.CTkEntry(parent, width=width)
@@ -2472,8 +2583,9 @@ class ManualReviewDialog(ctk.CTkToplevel):
 
     def _build_comparison_row(self, row_number, field):
         widgets = {"retrieved": "", "retrieved_url": ""}
-        ctk.CTkLabel(self.comparison_frame, text=field, width=140, anchor="w",
-                     font=ctk.CTkFont(weight="bold")).grid(row=row_number, column=0, sticky="nw", padx=6, pady=4)
+        ctk.CTkLabel(self.comparison_frame, text=field, width=140, anchor="w", justify="left",
+                     wraplength=135, font=ctk.CTkFont(weight="bold")).grid(
+                         row=row_number, column=0, sticky="nw", padx=6, pady=4)
         holder = ctk.CTkFrame(self.comparison_frame)
         holder.grid(row=row_number, column=1, sticky="nsew", padx=4, pady=3)
         holder.grid_columnconfigure(0, weight=1)
@@ -2504,6 +2616,17 @@ class ManualReviewDialog(ctk.CTkToplevel):
         widgets["ret_holder"] = ret_holder
         value_label = ctk.CTkLabel(ret_holder, text="", anchor="w", justify="left", wraplength=390)
         value_label.grid(row=0, column=0, sticky="ew", padx=7, pady=6)
+        wrap_state = {"width": 0}
+
+        def rewrap(event):
+            # Follow the column width instead of a fixed wrap, so long values
+            # use the space available and nothing runs off the edge.
+            if abs(event.width - wrap_state["width"]) > 20:
+                wrap_state["width"] = event.width
+                # wraplength is in unscaled units; event.width is in screen pixels.
+                scale = ctk.ScalingTracker.get_widget_scaling(value_label) or 1
+                value_label.configure(wraplength=max(150, int(event.width / scale) - 90))
+        ret_holder.bind("<Configure>", rewrap, add="+")
         value_label.bind("<Button-1>", lambda _event: widgets["retrieved_url"]
                          and webbrowser.open(widgets["retrieved_url"]))
         widgets["value_label"] = value_label
@@ -2529,7 +2652,11 @@ class ManualReviewDialog(ctk.CTkToplevel):
         ("Publication / container", core.JOURNAL_ALIASES, "Publication Title"),
         ("DOI", core.DOI_ALIASES, "DOI"),
         ("URL", core.URL_ALIASES, "Url"),
+        ("Abstract", abstract_tools.ABSTRACT_ALIASES, "Abstract Note"),
     ]
+    # Matched by exact column name only: a substring guess would pick up
+    # Abstract Finder's evidence columns ("Abstract Source", ...).
+    EXACT_NAME_FIELDS = {"Abstract"}
 
     # Columns already in the loaded file that hold looked-up / verified
     # values, in priority order. Verification output comes first, then the
@@ -2546,6 +2673,7 @@ class ManualReviewDialog(ctk.CTkToplevel):
         "Publication / container": ("Verification Metadata Container Title",),
         "DOI": ("Verification Metadata DOI", "doi", "Abstract Page DOI"),
         "URL": ("Resolved URL", "url", "Link", "Resource URL"),
+        "Abstract": (),  # no step retrieves a second abstract to compare with
     }
     _ALL_RETRIEVED_COLUMNS = frozenset(
         name for names in RETRIEVED_COLUMNS.values() for name in names)
@@ -2555,6 +2683,9 @@ class ManualReviewDialog(ctk.CTkToplevel):
         excluded, so e.g. the original ``DOI`` is used rather than the
         lookup's lowercase ``doi`` (case-insensitive guessing picked that)."""
         original = [c for c in columns if c not in self._ALL_RETRIEVED_COLUMNS]
+        if field in self.EXACT_NAME_FIELDS:
+            by_name = {str(c).strip().casefold(): c for c in original}
+            return next((by_name[a] for a in aliases if a in by_name), None)
         return core.guess_column(original, aliases)
 
     # Lookup-step columns shown on the input side when the record's own cell
@@ -5228,297 +5359,6 @@ class TranslatePage(ctk.CTkFrame):
 # ---------------------------------------------------------------------------
 # File converter: CSV / RIS / BibTeX with column selection and row filters
 # ---------------------------------------------------------------------------
-
-class FileConverterPage(ctk.CTkFrame):
-    """Convert between CSV, RIS and BibTeX, keeping chosen columns and rows."""
-    PREVIEW_ROWS = 200
-    FILTER_HINT = ("No filters — every record is converted. Choose a condition and click Apply; "
-                   "use 'Add another' to combine several with AND or OR.")
-
-    def __init__(self, master):
-        super().__init__(master, fg_color="transparent")
-        self.df = None
-        self.file_path = None
-        self.column_vars = {}
-        self.filter_conditions = []
-        self.table = None
-
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=4, pady=(6, 8))
-        ctk.CTkButton(top, text="Choose file…", width=130, command=self.on_choose_file).pack(side="left")
-        self.file_label = ctk.CTkLabel(
-            top, text="Choose a CSV, RIS, or BibTeX file to convert — this page does not call any API",
-            anchor="w")
-        self.file_label.pack(side="left", padx=12, fill="x", expand=True)
-        self.convert_btn = ctk.CTkButton(top, text="Convert & save…", width=150,
-                                         command=self.on_convert, state="disabled")
-        self.convert_btn.pack(side="right")
-        self.format_menu = ctk.CTkOptionMenu(
-            top, values=list(convert_tools.CONVERT_FORMATS), width=150,
-            command=lambda _v: self._update_summary())
-        self.format_menu.set("RIS (.ris)")
-        self.format_menu.pack(side="right", padx=(0, 8))
-        ctk.CTkLabel(top, text="Convert to").pack(side="right", padx=(0, 6))
-
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=4)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
-
-        sidebar = ctk.CTkFrame(body, width=225)
-        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
-        sidebar.grid_propagate(False)
-        ctk.CTkLabel(sidebar, text="Columns to keep", font=ctk.CTkFont(weight="bold")) \
-            .pack(anchor="w", padx=10, pady=(10, 4))
-        buttons = ctk.CTkFrame(sidebar, fg_color="transparent")
-        buttons.pack(fill="x", padx=8, pady=(0, 4))
-        ctk.CTkButton(buttons, text="All", width=95, command=lambda: self._set_all_columns(True)) \
-            .pack(side="left", padx=(0, 4))
-        ctk.CTkButton(buttons, text="None", width=95, command=lambda: self._set_all_columns(False)) \
-            .pack(side="left")
-        self.column_box = ctk.CTkScrollableFrame(sidebar)
-        self.column_box.pack(fill="both", expand=True, padx=6, pady=(0, 10))
-
-        main = ctk.CTkFrame(body, fg_color="transparent")
-        main.grid(row=0, column=1, sticky="nsew")
-        filters = ctk.CTkFrame(main)
-        filters.pack(fill="x", pady=(0, 7))
-        ctk.CTkLabel(filters, text="Filter records", font=ctk.CTkFont(weight="bold")) \
-            .grid(row=0, column=0, sticky="w", padx=10, pady=(7, 2))
-        ctk.CTkLabel(filters, text="Combine conditions with").grid(
-            row=0, column=1, columnspan=2, sticky="e", padx=(0, 6), pady=(7, 2))
-        self.filter_mode = ctk.CTkSegmentedButton(filters, values=["AND", "OR"], width=120)
-        self.filter_mode.set("AND")
-        self.filter_mode.grid(row=0, column=3, columnspan=2, sticky="w", padx=5, pady=(7, 2))
-        self.filter_column = _make_searchable_combobox(
-            filters, values=[NO_COLUMN], command=self._on_filter_column_change, width=210)
-        self.filter_column.grid(row=1, column=0, padx=(10, 5), pady=(0, 7))
-        self.filter_operator = ctk.CTkOptionMenu(
-            filters, values=convert_tools.TEXT_OPERATORS, width=140)
-        self.filter_operator.grid(row=1, column=1, padx=5, pady=(0, 7))
-        self.filter_value = _make_searchable_combobox(filters, values=[""], width=260, dropdown_rows=9)
-        self.filter_value.grid(row=1, column=2, padx=5, pady=(0, 7), sticky="w")
-        self.filter_value_to = ctk.CTkEntry(filters, width=105, placeholder_text="Upper value")
-        self.filter_value_to.grid(row=1, column=3, padx=5, pady=(0, 7))
-        ctk.CTkButton(filters, text="Add another", width=110, command=self.add_filter_condition) \
-            .grid(row=1, column=4, padx=5, pady=(0, 7))
-        ctk.CTkButton(filters, text="Apply", width=70, command=self.apply_filters) \
-            .grid(row=1, column=5, padx=5, pady=(0, 7))
-        ctk.CTkButton(filters, text="Clear", width=65, command=self.clear_filters) \
-            .grid(row=1, column=6, padx=(5, 10), pady=(0, 7))
-        self.filter_summary_box = ctk.CTkTextbox(
-            filters, height=52, wrap="word", activate_scrollbars=True,
-            font=ctk.CTkFont(size=12), text_color=("gray30", "gray70"))
-        self.filter_summary_box.grid(row=2, column=0, columnspan=8, sticky="ew", padx=10, pady=(0, 7))
-        _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
-        filters.grid_columnconfigure(7, weight=1)
-
-        self.summary_label = ctk.CTkLabel(main, text="Choose a file to begin", anchor="w",
-                                          text_color=("gray30", "gray70"))
-        self.summary_label.pack(fill="x", pady=(0, 5))
-        self.table_holder = ctk.CTkFrame(main, fg_color="transparent")
-        self.table_holder.pack(fill="both", expand=True, pady=(0, 6))
-
-    def on_choose_file(self):
-        path = filedialog.askopenfilename(
-            title="Choose a file to convert",
-            filetypes=[("Supported files", "*.csv *.ris *.bib *.bibtex"),
-                       ("CSV", "*.csv"), ("RIS", "*.ris"), ("BibTeX", "*.bib *.bibtex"),
-                       ("All files", "*.*")])
-        if not path:
-            return
-        if os.path.splitext(path)[1].lower() not in convert_tools.INPUT_EXTENSIONS:
-            messagebox.showwarning("Unsupported file", "Choose a .csv, .ris, or .bib file.")
-            return
-        try:
-            df = core.read_records_file(path, as_text=True).reset_index(drop=True)
-        except Exception as exc:
-            messagebox.showerror("Couldn't read file", f"Failed to read this file:\n{exc}")
-            return
-        if df.empty:
-            messagebox.showwarning("Empty file", "No records were found in this file.")
-            return
-        # Drop columns that are empty in every record (e.g. unused BibTeX fields).
-        df = df.fillna("")
-        df = df[[c for c in df.columns if df[c].astype(str).str.strip().ne("").any()]]
-        self.df, self.file_path = df, path
-        self.filter_conditions = []
-        self.filter_mode.set("AND")
-        encoding = df.attrs.get("source_encoding")
-        self.file_label.configure(
-            text=f"{os.path.basename(path)} ({len(df):,} records, {len(df.columns)} columns)"
-                 + (f" · {encoding}" if encoding else ""))
-        source_label = core.preferred_output_format_label(path)
-        other = [label for label, (_fmt, ext) in convert_tools.CONVERT_FORMATS.items()
-                 if not source_label.endswith(f"({ext})")]
-        self.format_menu.set(other[0])
-        self.convert_btn.configure(state="normal")
-        self._build_column_choices()
-        _update_combobox_values(self.filter_column, list(df.columns))
-        self.filter_column.set(str(df.columns[0]))
-        self._on_filter_column_change(str(df.columns[0]))
-        _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
-        self.render_preview()
-
-    def _build_column_choices(self):
-        for child in self.column_box.winfo_children():
-            child.destroy()
-        self.column_vars = {}
-        for column in self.df.columns:
-            var = ctk.BooleanVar(value=True)
-            self.column_vars[column] = var
-            ctk.CTkCheckBox(self.column_box, text=str(column), variable=var,
-                            command=self.render_preview).pack(anchor="w", padx=4, pady=3)
-
-    def _set_all_columns(self, selected):
-        for var in self.column_vars.values():
-            var.set(selected)
-        self.render_preview()
-
-    def selected_columns(self):
-        return [column for column, var in self.column_vars.items() if var.get()]
-
-    def _on_filter_column_change(self, column):
-        if self.df is None or column not in self.df.columns:
-            return
-        if convert_tools.is_numeric_column(self.df[column]):
-            self.filter_operator.configure(values=convert_tools.NUMERIC_OPERATORS)
-            self.filter_operator.set(">=")
-            _update_combobox_values(self.filter_value, [])
-            self.filter_value.set("")
-        else:
-            self.filter_operator.configure(values=convert_tools.TEXT_OPERATORS)
-            self.filter_operator.set("equals")
-            values = sorted({str(v).strip() for v in self.df[column] if str(v).strip()}, key=str.casefold)
-            _update_combobox_values(self.filter_value, values[:500] or [""])
-            self.filter_value.set(values[0] if values and len(values) <= 100 else "")
-
-    def _current_filter_condition(self):
-        if self.df is None:
-            messagebox.showinfo("Choose a file", "Load a file before creating filters.")
-            return None
-        column, operator = self.filter_column.get(), self.filter_operator.get()
-        value, upper = self.filter_value.get().strip(), self.filter_value_to.get().strip()
-        if column not in self.df.columns:
-            messagebox.showwarning("Choose a column", "Pick a column to filter on.")
-            return None
-        if operator not in convert_tools.NO_VALUE_OPERATORS and not value:
-            messagebox.showwarning("Missing filter value", "Enter or select a filter value.")
-            return None
-        if operator == "between" and not upper:
-            messagebox.showwarning("Missing upper value", "Enter both values for a between filter.")
-            return None
-        return column, operator, value, upper
-
-    def add_filter_condition(self):
-        condition = self._current_filter_condition()
-        if condition is None:
-            return
-        if condition not in self.filter_conditions:
-            self.filter_conditions.append(condition)
-        self._show_filter_summary(pending=True)
-
-    def apply_filters(self):
-        condition = self._current_filter_condition()
-        if condition is None:
-            return
-        if condition not in self.filter_conditions:
-            self.filter_conditions.append(condition)
-        try:
-            convert_tools.filter_dataframe(self.df, self.filter_conditions, self.filter_mode.get())
-        except (ValueError, KeyError) as exc:
-            self.filter_conditions.remove(condition)
-            messagebox.showerror("Invalid filter", f"The filter could not be applied:\n{exc}")
-            return
-        self.render_preview()
-
-    def clear_filters(self):
-        if self.df is None:
-            return
-        self.filter_conditions = []
-        _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
-        self.render_preview()
-
-    def _filtered(self):
-        return convert_tools.filter_dataframe(self.df, self.filter_conditions, self.filter_mode.get())
-
-    def _show_filter_summary(self, pending=False, matched=None):
-        if not self.filter_conditions:
-            _set_readonly_text(self.filter_summary_box, self.FILTER_HINT)
-            return
-        parts = []
-        for column, operator, value, upper in self.filter_conditions:
-            expression = f"{column} {operator} {value}".strip()
-            parts.append(expression + (f" and {upper}" if operator == "between" else ""))
-        prefix = "Pending | " if pending else f"Keeping {matched:,}/{len(self.df):,} records | "
-        _set_readonly_text(self.filter_summary_box, prefix + f" {self.filter_mode.get()} ".join(parts))
-
-    def render_preview(self):
-        if self.df is None:
-            return
-        filtered = self._filtered()
-        if self.filter_conditions:
-            self._show_filter_summary(matched=len(filtered))
-        if self.table is not None:
-            self.table.destroy()
-            self.table = None
-        columns = self.selected_columns()
-        if columns:
-            self.table = ResultsTable(self.table_holder, headers=columns, weights=[1] * len(columns))
-            self.table.pack(fill="both", expand=True)
-            copy_rows = filtered[columns].head(self.PREVIEW_ROWS).astype(str).values.tolist()
-            self.table.set_rows([[value[:180] for value in row] for row in copy_rows],
-                                copy_values=copy_rows)
-        self._update_summary(len(filtered))
-
-    def _update_summary(self, matched=None):
-        if self.df is None:
-            return
-        if matched is None:
-            matched = len(self._filtered())
-        columns = self.selected_columns()
-        if not columns:
-            self.summary_label.configure(text="Select at least one column to keep.")
-            return
-        fmt, _ext = convert_tools.CONVERT_FORMATS[self.format_menu.get()]
-        text = (f"Will convert {matched:,} of {len(self.df):,} records, {len(columns)} columns "
-                f"→ {self.format_menu.get()}")
-        if matched > self.PREVIEW_ROWS:
-            text += f" · preview shows the first {self.PREVIEW_ROWS}"
-        portable = convert_tools.portable_columns_for(columns, fmt)
-        if portable:
-            shown = ", ".join(map(str, portable[:4])) + (" …" if len(portable) > 4 else "")
-            text += f"\n{len(portable)} column(s) without a {self.format_menu.get().split()[0]} tag " \
-                    f"will be kept in the record Note: {shown}"
-        self.summary_label.configure(text=text, justify="left")
-
-    def on_convert(self):
-        if self.df is None:
-            return
-        columns = self.selected_columns()
-        if not columns:
-            messagebox.showwarning("No columns", "Select at least one column to keep.")
-            return
-        label = self.format_menu.get()
-        fmt, ext = convert_tools.CONVERT_FORMATS[label]
-        base = os.path.splitext(os.path.basename(self.file_path or "records"))[0]
-        path = filedialog.asksaveasfilename(
-            title="Save converted file", defaultextension=ext,
-            filetypes=[(label, f"*{ext}")], initialfile=f"{base}_converted{ext}")
-        if not path:
-            return
-        # A typed extension wins over the menu so the content matches the name.
-        chosen_ext = os.path.splitext(path)[1].lower().replace(".bibtex", ".bib")
-        fmt = next((f for f, e in convert_tools.CONVERT_FORMATS.values() if e == chosen_ext), fmt)
-        try:
-            count, portable = convert_tools.convert_file(
-                self.df, path, fmt, columns, self.filter_conditions, self.filter_mode.get())
-        except Exception as exc:
-            messagebox.showerror("Conversion failed", f"Couldn't save the converted file:\n{exc}")
-            return
-        extra = f"\n{len(portable)} column(s) were stored in the record Note." if portable else ""
-        messagebox.showinfo("Conversion complete", f"Saved {count:,} records to:\n{path}{extra}")
-
 
 if __name__ == "__main__":
     App().mainloop()

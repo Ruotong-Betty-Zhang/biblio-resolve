@@ -2036,9 +2036,14 @@ def write_records_file(df: pd.DataFrame, path: str, fmt: str, portable_columns=N
 
 
 def _value(row, *names):
-    columns = {str(k).strip().lower(): k for k in row.index}
+    columns = {}
+    for k in row.index:
+        columns.setdefault(str(k).strip().lower(), k)
     for name in names:
-        key = columns.get(name.lower())
+        # An exact column name wins over a case-insensitive one, so a file
+        # holding both "DOI" (the record's own) and "doi" (a lookup result)
+        # writes the record's own value into the DOI tag.
+        key = name if name in row.index else columns.get(name.lower())
         if key is not None:
             value = row.get(key)
             if value is not None and not pd.isna(value) and str(value).strip():
@@ -2253,6 +2258,17 @@ def _write_ris(df, path, portable_columns=None):
             f.write("ER  - \n\n")
 
 
+_BIBTEX_ESCAPE_RE = re.compile(r"\\([\\{}])")
+
+
+def _unescape_bibtex(value):
+    """Undo _write_bibtex's escaping of backslashes and braces in one pass.
+    Without this a backslash came back doubled, so the JSON "\\n" of a
+    portable Note field decoded to a literal backslash-n instead of a
+    newline. Other LaTeX escapes (\\"u, \\&, ...) are left untouched."""
+    return _BIBTEX_ESCAPE_RE.sub(r"\1", value)
+
+
 def _parse_bibtex_fields(body):
     """Parse BibTeX fields while preserving values with nested braces."""
     fields = {}
@@ -2276,7 +2292,7 @@ def _parse_bibtex_fields(body):
                 elif body[index] == "}" and (index == 0 or body[index - 1] != "\\"):
                     depth -= 1
                 index += 1
-            fields[name] = body[start + 1:index - 1 if depth == 0 else index].strip()
+            fields[name] = _unescape_bibtex(body[start + 1:index - 1 if depth == 0 else index].strip())
             cursor = index
         elif opener == '"':
             index = start + 1
@@ -2284,7 +2300,7 @@ def _parse_bibtex_fields(body):
                 if body[index] == '"' and body[index - 1] != "\\":
                     break
                 index += 1
-            fields[name] = body[start + 1:index].strip()
+            fields[name] = _unescape_bibtex(body[start + 1:index].strip())
             cursor = index + 1
         else:
             end = body.find(",", start)

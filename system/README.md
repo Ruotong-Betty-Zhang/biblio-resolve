@@ -39,17 +39,20 @@ without a technical background. Main workflow tabs include:
    records that currently have neither a URL nor a DOI.
 6. **Keyword Cleanup** — retain user-authored uppercase keywords while removing
    imported lowercase terms.
-7. **Manual Review** — open a previously exported result without making any
-   API requests. Choose exactly which columns are visible (Title, Year,
-   Author, DOI, and URL are selected automatically), click DOI/URL values,
-   record a decision and notes, add custom fields, and save a reviewed CSV or
-   Excel copy. The source file is not overwritten automatically.
-8. **File Converter** — convert a CSV, RIS, or BibTeX file into either of the
-   other two formats. Tick the columns to keep, optionally filter records
-   (text or numeric conditions combined with AND/OR), preview, and save.
-   Values are copied verbatim (no `12` → `12.0`). Kept columns that RIS or
-   BibTeX have no tag for are stored in the record Note and restored when the
-   file is read back by this app, so conversions round-trip without loss.
+7. **Review & Convert** — open a CSV, Excel, RIS, BibTeX or CSL JSON file
+   without making any API requests. Tick which columns are visible (Title,
+   Year, Author, DOI, and URL are ticked automatically), filter records (text
+   or numeric conditions combined with AND/OR), click DOI/URL values, record a
+   decision and notes, and add custom fields. The review queue compares each
+   record's key fields — Title, Authors, Year, Item type, Publisher,
+   Publication, DOI, URL and Abstract — with retrieved values stored in the
+   file; fields open read-only until **Edit fields** is switched on.
+   **Save as** writes CSV, Excel, RIS or BibTeX, with all or only the filtered
+   records and all or only the ticked columns, so the page doubles as a file
+   converter. Values are copied verbatim (no `12` → `12.0`). Columns that RIS
+   or BibTeX have no tag for are stored in the record Note and restored when
+   the file is read back by this app, so conversions round-trip without loss.
+   The source file is never overwritten automatically.
 
 Abstract identity checking is advisory and deliberately separate from abstract
 retention. `Abstract Match Status` is `matched`, `possible_mismatch`, or
