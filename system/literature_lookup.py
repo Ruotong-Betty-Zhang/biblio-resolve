@@ -1181,8 +1181,9 @@ def _style_chart_axes(figure, axes):
 
 # ---------------------------------------------------------------------------
 # ISSP module tags: classify which ISSP topical module a record used, from
-# ZA study numbers / GESIS DOIs / "ISSP <year>" mentions / topic keywords,
-# in that order of decreasing confidence (see issp_module_tags.py).
+# ZA study numbers / GESIS DOIs / exact module names / topic keywords /
+# meaning-based matching, in that order of decreasing confidence (see
+# issp_module_tags.py).
 # ---------------------------------------------------------------------------
 
 class IsspModulePage(ctk.CTkFrame):
@@ -1265,8 +1266,9 @@ class IsspModulePage(ctk.CTkFrame):
             self.stats_box, "Load a file to classify. No webpages are accessed unless the DOI "
                             "resolution checkbox above is enabled.")
         self.table = ResultsTable(
-            self, headers=["Title", "Tag", "Confidence", "Method", "Data countries", "Evidence"],
-            weights=[2, 0, 0, 1, 0, 3])
+            self, headers=["Title", "Tag", "Confidence", "Status", "Data countries", "Where found",
+                           "Quote / reason"],
+            weights=[2, 0, 0, 0, 0, 1, 3])
         self.table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
         self.after(150, self._poll_events)
 
@@ -1333,7 +1335,7 @@ class IsspModulePage(ctk.CTkFrame):
             try:
                 result_df, stats, tag_column = issp_tags.tag_issp_modules(
                     self.df, text_columns=text_columns, url_column=url, doi_column=doi,
-                    tag_column=tag,
+                    tag_column=tag, title_column=title,
                     use_network_doi_lookup=use_network_doi_lookup,
                     use_semantic_matching=use_semantic_matching,
                     fetch_full_text=fetch_full_text,
@@ -1384,19 +1386,24 @@ class IsspModulePage(ctk.CTkFrame):
         title_col = core.guess_column(self.output_df.columns, core.TITLE_ALIASES)
         rows = []
         for _, row in self.output_df.head(250).iterrows():
+            value = lambda column: abstract_tools.clean_value(row.get(column, ""))
+            tagged = value("ISSP Module Status") == issp_tags.STATUS_TAGGED
             rows.append((
-                abstract_tools.clean_value(row.get(title_col, ""))[:100] if title_col else "",
-                abstract_tools.clean_value(row.get("ISSP Module Tag", "")),
-                abstract_tools.clean_value(row.get("ISSP Module Confidence", "")),
-                abstract_tools.clean_value(row.get("ISSP Module Method", "")),
-                abstract_tools.clean_value(row.get("ISSP Data Countries", "")),
-                abstract_tools.clean_value(row.get("ISSP Module Evidence", "")),
+                value(title_col)[:100] if title_col else "",
+                value("ISSP Module Tag"),
+                value("ISSP Module Confidence"),
+                value("ISSP Module Status"),
+                value("ISSP Data Countries"),
+                value("ISSP Module Evidence Location") if tagged else "",
+                (value("ISSP Module Evidence Quote") or value("ISSP Module Evidence")) if tagged
+                else value("ISSP Module Status Reason"),
             ))
         self.table.set_rows(rows)
 
     def on_export(self):
         if self.output_df is not None:
-            _save_enriched_dataframe(self, self.output_df, self.file_path, "issp_module_tags")
+            _save_enriched_dataframe(self, self.output_df, self.file_path, "issp_module_tags",
+                                     format_label=self.output_format.get())
 
 
 # ---------------------------------------------------------------------------

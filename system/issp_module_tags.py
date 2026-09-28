@@ -20,14 +20,12 @@ Tiers, from most to least reliable:
    - A GESIS dataset DOI (10.4232/1.xxxxx) cited in the text. Resolved
      live against the DataCite API to read the title (which names the
      module) - requires network access.
-   - The exact module name found verbatim in the text. Seven of the
-     twelve names are distinctive multi-word phrases ("Family and
-     Changing Gender Roles", "Work Orientations", ...) unlikely to appear
-     in an unrelated paper by coincidence, so they count on their own.
-     The other five (Religion, Environment, Citizenship, National
-     Identity, Social Networks) are also everyday academic vocabulary, so
-     they only count here when they appear near an explicit "ISSP"
-     mention - otherwise they are left to the keyword tier below.
+   - The exact module name found verbatim (as whole words) in the text.
+     Ten of the twelve names count on their own. The other two
+     (Citizenship, National Identity) are also everyday political-science
+     vocabulary, so they only count here when they appear near an
+     explicit "ISSP" mention - otherwise they are left to the keyword
+     tier below.
 2. Medium confidence - scored keyword/topic matching: each module has a
    list of topic phrases, and a module only counts if it clears a minimum
    number of distinct phrase hits (a single incidental phrase like "job
@@ -195,24 +193,25 @@ EXACT_MODULE_NAMES = {
     "social networks and social resources": "SOCNET",
     "social networks and support systems": "SOCNET",
     "social relations and support systems": "SOCNET",
+    "religion": "RELIG",
+    "environment": "ENV",
+    "social networks": "SOCNET",
 }
-# These five module names double as everyday academic vocabulary, so
+# These two module names double as everyday academic vocabulary, so
 # finding the bare word/phrase proves nothing on its own - it only counts
 # as exact-name evidence when it appears within ISSP_PROXIMITY_CHARS of an
 # explicit "ISSP" mention. Without that, they still get a fair shot via
 # the ordinary keyword tier below (TOPIC_KEYWORDS), just not promoted to
 # high confidence.
 EXACT_MODULE_NAMES_NEEDS_ISSP_NEARBY = {
-    "religion": "RELIG",
-    "environment": "ENV",
     "citizenship": "CIT",
     "national identity": "NATID",
-    "social networks": "SOCNET",
 }
 ISSP_PROXIMITY_CHARS = 120
 
-# Keyword tier: a module only wins if it clears MIN_KEYWORD_SCORE distinct
-# phrase hits *and* no other module ties it - a single incidental phrase
+# Keyword tier: a module counts if it clears MIN_KEYWORD_SCORE distinct
+# phrase hits; every module that clears it is kept, even if several tie
+# - a record can use more than one module. A single incidental phrase
 # (e.g. "job satisfaction" in an unrelated labour-economics paper) should
 # not by itself tag a record as ISSP Work Orientations. Broader/more
 # numerous than a first pass would need, specifically so genuinely on-topic
@@ -341,47 +340,320 @@ ISSP_ANCHOR_RE = r"(?:\bissp\b|international social survey program(?:me)?)"
 
 
 def _name_near_issp(text, name, window=ISSP_PROXIMITY_CHARS):
-    """True if `name` appears within `window` characters of an "ISSP"
-    mention - the acronym or its spelled-out name, since many papers
-    (especially formal reports) use the full name on first mention rather
-    than the acronym - checked in both directions. Used to gate the five
-    generic exact-module-names that are also everyday academic vocabulary."""
+    """Return the (start, end) span of the first place `name` appears
+    within `window` characters of an "ISSP" mention - the acronym or its
+    spelled-out name, since many papers (especially formal reports) use the
+    full name on first mention rather than the acronym - checked in both
+    directions, or None. Used to gate the generic exact-module-names that
+    are also everyday academic vocabulary."""
+    name_re = r"(?<!\w)" + re.escape(name) + r"(?!\w)"
     pattern = re.compile(
-        ISSP_ANCHOR_RE + r".{0," + str(window) + "}" + re.escape(name) + "|" +
-        re.escape(name) + r".{0," + str(window) + "}" + ISSP_ANCHOR_RE,
+        ISSP_ANCHOR_RE + r".{0," + str(window) + "}" + name_re + "|" +
+        name_re + r".{0," + str(window) + "}" + ISSP_ANCHOR_RE,
         re.IGNORECASE | re.DOTALL)
-    return bool(pattern.search(text))
+    match = pattern.search(text)
+    return match.span() if match else None
 
 
-# ISSP's 41 member countries (issp.org/members/member-states/), spelled
-# the way ISSP itself spells them (e.g. "Great Britain", "South Korea") -
-# a DATA tag uses this exact spelling regardless of which alias matched.
-# Aliases are deliberately conservative (no bare 2-letter codes like "UK"
-# or "US") since these are matched with only a word-boundary, not a full
-# name-detector, and the context-proximity check below is the main guard
-# against false positives, not the alias list itself.
-DATA_COUNTRY_ALIASES = {
-    "Canada": ["canada"], "Mexico": ["mexico"], "USA": ["usa", "united states of america",
-    "united states"], "Chile": ["chile"], "Suriname": ["suriname"],
-    "South Africa": ["south africa"], "Austria": ["austria"], "Bulgaria": ["bulgaria"],
-    "Croatia": ["croatia"], "Czech Republic": ["czech republic", "czechia"],
-    "Denmark": ["denmark"], "Estonia": ["estonia"], "Finland": ["finland"],
-    "France": ["france"], "Germany": ["germany"],
-    "Great Britain": ["great britain", "united kingdom"], "Greece": ["greece"],
-    "Hungary": ["hungary"], "Iceland": ["iceland"], "Israel": ["israel"], "Italy": ["italy"],
-    "Lithuania": ["lithuania"], "Netherlands": ["netherlands"], "Norway": ["norway"],
-    "Poland": ["poland"], "Russia": ["russia", "russian federation"],
-    "Slovakia": ["slovakia"], "Slovenia": ["slovenia"], "Spain": ["spain"],
-    "Sweden": ["sweden"], "Switzerland": ["switzerland"], "Turkey": ["turkey", "türkiye"],
-    "Ukraine": ["ukraine"], "India": ["india"], "Japan": ["japan"],
-    "Philippines": ["philippines"], "South Korea": ["south korea", "republic of korea"],
-    "Taiwan": ["taiwan"], "Thailand": ["thailand"], "Australia": ["australia"],
-    "New Zealand": ["new zealand"],
-}
-# Only a country appearing near one of these counts as "the author used
-# this country's data" - a bare mention is very often just "prior research
-# in Germany found X", i.e. citing someone else's study, not the author's
-# own data source.
+# ---------------------------------------------------------------------------
+# Sentence splitting - shared by the country tier (a country and its data
+# phrase must be in the same sentence) and by the evidence quotes.
+# ---------------------------------------------------------------------------
+
+# A sentence ends at . ! or ? (optionally followed by a closing quote or
+# bracket) when the next sentence starts with a capital letter or digit,
+# or at any line break (the fields of a record are joined by newlines, so
+# a title and an abstract are never treated as one sentence).
+_SENTENCE_BREAK_RE = re.compile(r"([.!?]+[\"')\]”]*)\s+(?=[\"'(\[“]?[A-Z0-9])|\n+")
+# ...unless the full stop belongs to an abbreviation: single-letter
+# initials ("U.S.", "U.K.", "e.g.", "J. Smith") or a common short form.
+_ABBREVIATION_RE = re.compile(
+    r"(?:(?<![A-Za-z])(?:[A-Za-z]\.){1,3}|\b(?:al|vs|cf|ca|approx|fig|no|vol|dr|prof|st)\.)$",
+    re.IGNORECASE)
+
+
+def sentence_spans(text, start=0, end=None):
+    """Split text[start:end] into sentences and return their (start, end)
+    offsets in `text`."""
+    end = len(text) if end is None else end
+    spans, current = [], start
+    for match in _SENTENCE_BREAK_RE.finditer(text, start, end):
+        if match.group(1):
+            if _ABBREVIATION_RE.search(text[max(start, match.start() - 12):match.start() + 1]):
+                continue
+            sentence_end = match.end(1)
+        else:
+            sentence_end = match.start()
+        if text[current:sentence_end].strip():
+            spans.append((current, sentence_end))
+        current = match.end()
+    if text[current:end].strip():
+        spans.append((current, end))
+    return spans
+
+
+# Every country (and a few territories), one per line:
+#   Canonical name | other names ; ... | nationality adjectives ; ...
+# The canonical name is what goes into the "DATA - <country>" tag. The 41
+# ISSP member countries keep ISSP's own spelling ("Great Britain", "USA",
+# "South Korea", "Czech Republic"). Names are matched case-insensitively
+# as whole words; when two overlap, the longest wins, so "Northern
+# Ireland" is not also Ireland and "Papua New Guinea" is not also Guinea.
+# Adjectives are weaker evidence ("German" is also a first name and
+# surname) - see extract_data_country_evidence() for how they are used.
+# "English" is deliberately not an adjective for England: it is far more
+# often the language ("an English-language survey").
+COUNTRY_TABLE = """
+Afghanistan | | afghan
+Albania | | albanian
+Algeria | | algerian
+Andorra | | andorran
+Angola | | angolan
+Antigua and Barbuda | |
+Argentina | | argentine; argentinian; argentinean
+Armenia | | armenian
+Australia | | australian
+Austria | | austrian
+Azerbaijan | | azerbaijani
+Bahamas | | bahamian
+Bahrain | | bahraini
+Bangladesh | | bangladeshi
+Barbados | | barbadian
+Belarus | | belarusian
+Belgium | | belgian
+Belize | | belizean
+Benin | | beninese
+Bhutan | | bhutanese
+Bolivia | | bolivian
+Bosnia and Herzegovina | bosnia | bosnian
+Botswana | |
+Brazil | | brazilian
+Brunei | |
+Bulgaria | | bulgarian
+Burkina Faso | | burkinabe
+Burundi | | burundian
+Cabo Verde | cape verde | cape verdean
+Cambodia | | cambodian
+Cameroon | | cameroonian
+Canada | | canadian
+Central African Republic | |
+Chad | | chadian
+Chile | | chilean
+China | people's republic of china; mainland china | chinese
+Colombia | | colombian
+Comoros | |
+Congo | republic of the congo; congo-brazzaville | congolese
+DR Congo | democratic republic of the congo; democratic republic of congo; congo-kinshasa |
+Costa Rica | | costa rican
+Cote d'Ivoire | côte d'ivoire; ivory coast | ivorian
+Croatia | | croatian
+Cuba | | cuban
+Cyprus | | cypriot
+Czech Republic | czechia | czech
+Denmark | | danish
+Djibouti | |
+Dominica | |
+Dominican Republic | | dominican
+Ecuador | | ecuadorian
+Egypt | | egyptian
+El Salvador | | salvadoran
+Equatorial Guinea | |
+Eritrea | | eritrean
+Estonia | | estonian
+Eswatini | swaziland |
+Ethiopia | | ethiopian
+Fiji | | fijian
+Finland | | finnish
+France | | french
+Gabon | | gabonese
+Gambia | | gambian
+Georgia | | georgian
+Germany | west germany; east germany | german; west german; east german
+Ghana | | ghanaian
+Greece | | greek
+Grenada | |
+Guatemala | | guatemalan
+Guinea | | guinean
+Guinea-Bissau | |
+Guyana | | guyanese
+Haiti | | haitian
+Honduras | | honduran
+Hong Kong | |
+Hungary | | hungarian
+Iceland | | icelandic
+India | | indian
+Indonesia | | indonesian
+Iran | | iranian
+Iraq | | iraqi
+Ireland | republic of ireland | irish
+Israel | | israeli
+Italy | | italian
+Jamaica | | jamaican
+Japan | | japanese
+Jordan | | jordanian
+Kazakhstan | | kazakh; kazakhstani
+Kenya | | kenyan
+Kiribati | |
+Kosovo | | kosovar
+Kuwait | | kuwaiti
+Kyrgyzstan | kyrgyz republic | kyrgyz
+Laos | lao pdr | laotian
+Latvia | | latvian
+Lebanon | | lebanese
+Lesotho | |
+Liberia | | liberian
+Libya | | libyan
+Liechtenstein | |
+Lithuania | | lithuanian
+Luxembourg | | luxembourgish
+Macao | macau |
+Madagascar | | malagasy
+Malawi | | malawian
+Malaysia | | malaysian
+Maldives | | maldivian
+Mali | | malian
+Malta | | maltese
+Marshall Islands | |
+Mauritania | | mauritanian
+Mauritius | | mauritian
+Mexico | | mexican
+Micronesia | |
+Moldova | | moldovan
+Monaco | |
+Mongolia | | mongolian
+Montenegro | | montenegrin
+Morocco | | moroccan
+Mozambique | | mozambican
+Myanmar | burma | burmese
+Namibia | | namibian
+Nauru | |
+Nepal | | nepalese; nepali
+Netherlands | holland | dutch
+New Zealand | | new zealander
+Nicaragua | | nicaraguan
+Niger | | nigerien
+Nigeria | | nigerian
+North Korea | democratic people's republic of korea | north korean
+North Macedonia | macedonia | macedonian
+Norway | | norwegian
+Oman | | omani
+Pakistan | | pakistani
+Palau | |
+Palestine | palestinian territories | palestinian
+Panama | | panamanian
+Papua New Guinea | |
+Paraguay | | paraguayan
+Peru | | peruvian
+Philippines | | filipino; philippine
+Poland | | polish
+Portugal | | portuguese
+Puerto Rico | | puerto rican
+Qatar | | qatari
+Romania | | romanian
+Russia | russian federation | russian
+Rwanda | | rwandan
+Saint Kitts and Nevis | |
+Saint Lucia | |
+Saint Vincent and the Grenadines | |
+Samoa | | samoan
+San Marino | |
+Sao Tome and Principe | são tomé and príncipe |
+Saudi Arabia | | saudi
+Senegal | | senegalese
+Serbia | | serbian
+Seychelles | |
+Sierra Leone | | sierra leonean
+Singapore | | singaporean
+Slovakia | slovak republic | slovak
+Slovenia | | slovenian; slovene
+Solomon Islands | |
+Somalia | | somali
+South Africa | | south african
+South Korea | republic of korea; korea | south korean; korean
+South Sudan | | south sudanese
+Spain | | spanish
+Sri Lanka | | sri lankan
+Sudan | | sudanese
+Suriname | | surinamese
+Sweden | | swedish
+Switzerland | | swiss
+Syria | | syrian
+Taiwan | | taiwanese
+Tajikistan | | tajik
+Tanzania | | tanzanian
+Thailand | | thai
+Timor-Leste | east timor | timorese
+Togo | | togolese
+Tonga | | tongan
+Trinidad and Tobago | | trinidadian
+Tunisia | | tunisian
+Turkey | türkiye; turkiye | turkish
+Turkmenistan | | turkmen
+Tuvalu | |
+Uganda | | ugandan
+Ukraine | | ukrainian
+United Arab Emirates | | emirati
+Great Britain | united kingdom; britain; u.k.; uk | british
+England | |
+Scotland | | scottish
+Wales | | welsh
+Northern Ireland | | northern irish
+USA | united states; united states of america; u.s.; u.s.a.; america | american
+Uruguay | | uruguayan
+Uzbekistan | | uzbek
+Vanuatu | |
+Vatican City | holy see |
+Venezuela | | venezuelan
+Vietnam | viet nam | vietnamese
+Yemen | | yemeni
+Zambia | | zambian
+Zimbabwe | | zimbabwean
+"""
+# Short codes that are also ordinary words in lower case ("us") are only
+# accepted exactly as written here.
+COUNTRY_CASE_SENSITIVE_NAMES = {"US": "USA", "UAE": "United Arab Emirates", "PRC": "China"}
+# A single-word name or adjective right after one of these words is part
+# of a larger region or group, not the country: "Latin America", "North
+# American", "African American respondents", "East Asian".
+_REGION_PREFIXES = ["latin", "north", "south", "central", "east", "west", "northern",
+                    "southern", "eastern", "western", "african", "asian", "mexican",
+                    "native", "anglo", "pan", "sub-saharan"]
+
+
+def _parse_country_table(table):
+    names, adjectives = {}, {}
+    for line in table.strip().splitlines():
+        canonical, other_names, adjective_list = (part.strip() for part in line.split("|"))
+        for name in [canonical] + other_names.split(";"):
+            if name.strip():
+                names[name.strip().casefold()] = canonical
+        for adjective in adjective_list.split(";"):
+            if adjective.strip():
+                adjectives[adjective.strip().casefold()] = canonical
+    return names, adjectives
+
+
+COUNTRY_NAME_TO_CANONICAL, COUNTRY_ADJECTIVE_TO_CANONICAL = _parse_country_table(COUNTRY_TABLE)
+ALL_COUNTRIES = sorted(set(COUNTRY_NAME_TO_CANONICAL.values()) | set(COUNTRY_CASE_SENSITIVE_NAMES.values()))
+
+
+def _mention_re(terms, flags):
+    ordered = sorted(terms, key=len, reverse=True)  # longest wins
+    not_after_region = "".join(f"(?<!{re.escape(prefix)} )" for prefix in _REGION_PREFIXES)
+    return re.compile(not_after_region + r"(?<![\w-])(?:" +
+                      "|".join(re.escape(term) for term in ordered) + r")(?![\w-])", flags)
+
+
+_COUNTRY_MENTION_RE = _mention_re(
+    list(COUNTRY_NAME_TO_CANONICAL) + list(COUNTRY_ADJECTIVE_TO_CANONICAL), re.IGNORECASE)
+_COUNTRY_CASE_SENSITIVE_RE = _mention_re(list(COUNTRY_CASE_SENSITIVE_NAMES), 0)
+
+# A country name counts as "the author used this country's data" when it
+# is in the same sentence as one of these phrases, within
+# COUNTRY_PROXIMITY_CHARS - a bare mention is very often just "prior
+# research in Germany found X", citing someone else's study. Requiring the
+# same sentence stops "Other work is based on Japan. This paper uses data
+# from ..." from tagging Japan.
 DATA_CONTEXT_PHRASES = [
     "data from", "sample from", "survey conducted in", "respondents from",
     "fieldwork in", "collected in", "data collected in", "survey data from",
@@ -390,33 +662,72 @@ DATA_CONTEXT_PHRASES = [
     "international social survey programme",
 ]
 COUNTRY_PROXIMITY_CHARS = 150
+_DATA_CONTEXT_RE = re.compile(
+    "|".join(r"\b" + re.escape(phrase) + r"\b" for phrase in DATA_CONTEXT_PHRASES), re.IGNORECASE)
+# A name or adjective also counts when followed (at most two words in
+# between) by one of these: "UK data", "the UK's survey", "German
+# respondents", "Chinese General Social Survey".
+DATA_NOUN_RE = (r"(?:data|dataset|datasets|microdata|sample|samples|survey|surveys|respondents|"
+                r"adults|households|panel|census)")
+_NAME_FOLLOWED_BY_NOUN_RE = re.compile(
+    r"(?:['’]s)?(?:[\s-]+[\w'-]+){0,2}?[\s-]+" + DATA_NOUN_RE + r"\b", re.IGNORECASE)
+# For adjectives the words in between may not be possessives, so a person
+# called German is not a country: "German Lopez's survey" does not count.
+_ADJECTIVE_FOLLOWED_BY_NOUN_RE = re.compile(
+    r"(?:[\s-]+[\w-]+){0,2}?[\s-]+" + DATA_NOUN_RE + r"\b", re.IGNORECASE)
 
 
-def _near_any_phrase(text, name, phrases, window):
-    """True if `name` appears within `window` characters of any of
-    `phrases` (checked in both directions)."""
-    anchor = "(?:" + "|".join(re.escape(phrase) for phrase in phrases) + ")"
-    pattern = re.compile(
-        anchor + r".{0," + str(window) + r"}\b" + re.escape(name) + r"\b|"
-        r"\b" + re.escape(name) + r"\b.{0," + str(window) + "}" + anchor,
-        re.IGNORECASE | re.DOTALL)
-    return bool(pattern.search(text))
+def _country_mentions(sentence):
+    """[(canonical, is_adjective, start, end), ...] in `sentence`."""
+    mentions = []
+    for match in _COUNTRY_MENTION_RE.finditer(sentence):
+        term = match.group(0).casefold()
+        if term in COUNTRY_NAME_TO_CANONICAL:
+            mentions.append((COUNTRY_NAME_TO_CANONICAL[term], False, match.start(), match.end()))
+        else:
+            mentions.append((COUNTRY_ADJECTIVE_TO_CANONICAL[term], True, match.start(), match.end()))
+    for match in _COUNTRY_CASE_SENSITIVE_RE.finditer(sentence):
+        mentions.append((COUNTRY_CASE_SENSITIVE_NAMES[match.group(0)], False,
+                         match.start(), match.end()))
+    return mentions
+
+
+def _mention_in_data_context(sentence, is_adjective, start, end):
+    if is_adjective:
+        return bool(_ADJECTIVE_FOLLOWED_BY_NOUN_RE.match(sentence, end))
+    if _NAME_FOLLOWED_BY_NOUN_RE.match(sentence, end):
+        return True
+    return bool(_DATA_CONTEXT_RE.search(sentence, max(0, start - COUNTRY_PROXIMITY_CHARS), start) or
+                _DATA_CONTEXT_RE.search(sentence, end, end + COUNTRY_PROXIMITY_CHARS))
+
+
+def extract_data_country_evidence(text):
+    """Return {canonical country: (start, end) of the first sentence that
+    shows the author used that country's data}. In one sentence:
+    - a country name counts next to a data-source phrase ("data from
+      Germany and France", "ISSP ... Poland") or when followed by a data
+      noun ("UK data", "Japan survey");
+    - a nationality adjective counts only when followed by a data noun
+      ("German respondents", "Chinese General Social Survey"), never next
+      to a phrase alone, since "German" is also a personal name.
+    Papers routinely mention other countries' unrelated prior research in
+    passing, hence the same-sentence rule."""
+    text = text or ""
+    found = {}
+    if not (_COUNTRY_MENTION_RE.search(text) or _COUNTRY_CASE_SENSITIVE_RE.search(text)):
+        return found
+    for start, end in sentence_spans(text):
+        sentence = text[start:end]
+        for canonical, is_adjective, mention_start, mention_end in _country_mentions(sentence):
+            if canonical not in found and _mention_in_data_context(
+                    sentence, is_adjective, mention_start, mention_end):
+                found[canonical] = (start, end)
+    return found
 
 
 def extract_data_countries(text):
-    """Return the set of canonical ISSP member-country names mentioned
-    near a data-source context phrase (e.g. "data from Germany and
-    France") - not just mentioned anywhere, since papers routinely cite
-    other countries' unrelated prior research in passing."""
-    text = text or ""
-    found = set()
-    for canonical, aliases in DATA_COUNTRY_ALIASES.items():
-        for alias in aliases:
-            if re.search(r"\b" + re.escape(alias) + r"\b", text, re.IGNORECASE) and \
-                    _near_any_phrase(text, alias, DATA_CONTEXT_PHRASES, COUNTRY_PROXIMITY_CHARS):
-                found.add(canonical)
-                break
-    return found
+    """Set of countries from extract_data_country_evidence()."""
+    return set(extract_data_country_evidence(text))
 
 
 def data_country_tag(country):
@@ -503,7 +814,9 @@ _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
 
 
 def classify_record(text, doi_resolver=None, embedding_matcher=None):
-    """Return a list of {"tag", "confidence", "method", "evidence"} dicts,
+    """Return a list of {"tag", "confidence", "method", "evidence", "spans"}
+    dicts ("spans" = (start, end) offsets in `text` of what was matched,
+    empty for the semantic tier),
     one per distinct module this record has evidence for (never more than
     one entry per tag - if several tiers find the same module, only the
     best-confidence one is kept). An empty-evidence record still gets a
@@ -522,50 +835,63 @@ def classify_record(text, doi_resolver=None, embedding_matcher=None):
     folded = text.casefold()
     found = {}
 
-    def add(tag, confidence, method, evidence):
+    def add(tag, confidence, method, evidence, spans=()):
         if tag is None:
             return
         existing = found.get(tag)
         if existing is None or _CONFIDENCE_RANK[confidence] > _CONFIDENCE_RANK[existing["confidence"]]:
             found[tag] = {"tag": tag, "confidence": confidence, "method": method,
-                          "evidence": evidence}
+                          "evidence": evidence, "spans": list(spans)}
 
     # Tier 1a: ZA study numbers - every one that resolves.
-    for za in sorted(extract_za_numbers(text)):
+    za_spans = {}
+    for match in ZA_RE.finditer(text):
+        za_spans.setdefault(int(match.group(1)), match.span())
+    for za in sorted(za_spans):
         if za in ZA_TO_TAG:
-            add(ZA_TO_TAG[za], "high", "za_number", f"ZA{za} cited in text")
+            add(ZA_TO_TAG[za], "high", "za_number", f"ZA{za} cited in text", [za_spans[za]])
 
     # Tier 1b: GESIS dataset DOIs - every one that resolves to a real title.
     if doi_resolver is not None:
-        for doi in sorted(extract_gesis_dois(text)):
+        doi_spans = {}
+        for match in GESIS_DOI_RE.finditer(text):
+            doi_spans.setdefault(match.group(0).casefold(), match.span())
+        for doi in sorted(doi_spans):
             try:
                 title = doi_resolver(doi)
             except Exception:
                 continue
             tag = topic_from_title(title)
             if tag:
-                add(tag, "high", "gesis_doi", f"DOI {doi} resolved to '{title}'")
+                add(tag, "high", "gesis_doi", f"DOI {doi} resolved to '{title}'", [doi_spans[doi]])
 
-    # Tier 1c: exact module name found verbatim.
+    # Tier 1c: exact module name found verbatim, as whole words (so
+    # "environmental" does not count as the module name "environment").
     for name, tag in EXACT_MODULE_NAMES.items():
-        if name in folded:
-            add(tag, "high", "exact_module_name", f"Exact module name '{name}' found in text")
+        match = re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.IGNORECASE)
+        if match:
+            add(tag, "high", "exact_module_name", f"Exact module name '{name}' found in text",
+                [match.span()])
     for name, tag in EXACT_MODULE_NAMES_NEEDS_ISSP_NEARBY.items():
-        if name in folded and _name_near_issp(text, name):
+        span = _name_near_issp(text, name) if name in folded else None
+        if span:
             add(tag, "high", "exact_module_name",
-                f"Exact module name '{name}' found near an ISSP mention")
+                f"Exact module name '{name}' found near an ISSP mention", [span])
 
     # Tier 2: scored keywords - every module that independently clears the
     # minimum score, not only a unique winner.
-    scores = {tag: sum(1 for phrase in phrases if phrase in folded)
-              for tag, phrases in TOPIC_KEYWORDS.items()}
-    for tag, score in scores.items():
-        if score >= MIN_KEYWORD_SCORE:
+    for tag, phrases in TOPIC_KEYWORDS.items():
+        hits = [phrase for phrase in phrases if phrase in folded]
+        if len(hits) >= MIN_KEYWORD_SCORE:
+            spans = [match.span() for match in
+                     (re.search(re.escape(phrase), text, re.IGNORECASE) for phrase in hits) if match]
             add(tag, "medium", "keyword",
-                f"Matched {score} topic keyword(s) for {tag}, no explicit ISSP citation found")
+                f"Matched {len(hits)} topic keyword(s) for {tag} ({', '.join(hits)}), no "
+                f"explicit ISSP citation found", spans)
 
     # Tier 3: semantic similarity - always runs; adds its single best
-    # candidate only if that module wasn't already found above.
+    # candidate only if that module wasn't already found above. It judges
+    # the whole text, so it has no single quotable span.
     if embedding_matcher is not None:
         try:
             tag, similarity = embedding_matcher(text)
@@ -578,7 +904,7 @@ def classify_record(text, doi_resolver=None, embedding_matcher=None):
 
     if not found:
         return [{"tag": None, "confidence": "none", "method": "no_evidence",
-                 "evidence": "No ISSP module evidence found"}]
+                 "evidence": "No ISSP module evidence found", "spans": []}]
     return sorted(found.values(), key=lambda r: (-_CONFIDENCE_RANK[r["confidence"]], r["tag"]))
 
 
@@ -663,8 +989,123 @@ def append_full_text_cache_entry(key, payload, saved_at=None):
             stream.flush()
 
 
+# ---------------------------------------------------------------------------
+# Evidence location and status helpers for tag_issp_modules().
+# ---------------------------------------------------------------------------
+
+STATUS_TAGGED = "Tagged"
+STATUS_NOT_REPORTED = "Not reported"
+STATUS_UNAVAILABLE = "Unavailable"
+STATUS_CANCELLED = "Cancelled"
+FULL_TEXT_LABEL = "Full text"
+SEMANTIC_LOCATION = "Whole searched text (meaning-based match)"
+MAX_QUOTE_CHARS = 300
+MAX_QUOTES_PER_TAG = 2
+FULL_TEXT_OK_STATUSES = {"abstract_found", "no_abstract_found"}
+FETCH_STATUS_TEXT = {
+    "no_link": "no URL/DOI to download",
+    "fetch_failed": "download failed",
+    "parse_failed": "the page/PDF could not be read",
+    "pdf_too_large": "PDF over the size limit",
+}
+
+
+# What does not count as readable text when deciding "Not reported" vs
+# "Unavailable": HTML tags, links, bracketed dataset markers such as
+# "(ISSP) (EVS)", and database export stamps ("Export Date: ...; Cited By: 3").
+_NON_PROSE_RE = re.compile(
+    r"<[^>]+>|&\w+;|\b(?:https?://|www\.)\S+|\(\s*[A-Z][A-Za-z0-9-]{1,15}\s*\)|"
+    r"\bexport date:[^;\n]*;?|\bcited by:?\s*\d+", re.IGNORECASE)
+MIN_READABLE_WORDS = 15
+
+
+def has_readable_text(value):
+    """True if `value` still has MIN_READABLE_WORDS words once markup,
+    links, dataset markers, and export stamps are removed - i.e. it is an
+    actual abstract/note/full text a person could have read for a module."""
+    return len(re.findall(r"[^\W\d_]{2,}", _NON_PROSE_RE.sub(" ", value or ""))) >= MIN_READABLE_WORDS
+
+
+def _join_labelled_parts(parts):
+    """`parts` is [(label, value, is_body), ...]. Join the non-empty values
+    with newlines and return (text, segments), where each segment is
+    (label, start, end, is_body) - the offsets of that value in `text`."""
+    values, segments, position = [], [], 0
+    for label, value, is_body in parts:
+        if not value:
+            continue
+        if values:
+            position += 1  # the "\n" separator
+        segments.append((label, position, position + len(value), is_body))
+        values.append(value)
+        position += len(value)
+    return "\n".join(values), segments
+
+
+def _segment_at(segments, offset):
+    for segment in segments:
+        if segment[1] <= offset < segment[2]:
+            return segment
+    return None
+
+
+def _quote(text, span, segment):
+    """The sentence(s) around `span`, never crossing out of its segment,
+    shortened to about MAX_QUOTE_CHARS around the match if very long."""
+    _label, seg_start, seg_end, _is_body = segment
+    start, end = span
+    sentences = sentence_spans(text, seg_start, seg_end)
+    quote_start = next((s for s, e in sentences if s <= start < e), seg_start)
+    quote_end = next((e for s, e in sentences if s < end <= e), seg_end)
+    prefix = suffix = ""
+    if quote_end - quote_start > MAX_QUOTE_CHARS:
+        room = max(0, (MAX_QUOTE_CHARS - (end - start)) // 2)
+        if start - room > quote_start:
+            quote_start, prefix = start - room, "…"
+        if end + room < quote_end:
+            quote_end, suffix = end + room, "…"
+    return prefix + re.sub(r"\s+", " ", text[quote_start:quote_end]).strip() + suffix
+
+
+def _evidence_location_and_quotes(text, segments, spans):
+    """Return (ordered unique segment labels, list of quotes) for spans."""
+    labels, quotes = [], []
+    for span in spans:
+        segment = _segment_at(segments, span[0])
+        if segment is None:
+            continue
+        if segment[0] not in labels:
+            labels.append(segment[0])
+        quote = _quote(text, span, segment)
+        if quote not in quotes and len(quotes) < MAX_QUOTES_PER_TAG:
+            quotes.append(quote)
+    return labels, quotes
+
+
+def _status_for(matched, segments, fetch_status):
+    """Tagged / Not reported / Unavailable, plus a short reason.
+    Not reported = there was real text to read (an abstract, notes, or
+    downloaded full text - see has_readable_text) and it named no module.
+    Unavailable = there was only a title/identifier (or a note like
+    "(ISSP)") to go on, so "no module" is not a finding."""
+    body = [segment[0] for segment in segments if segment[3]]
+    if matched:
+        return STATUS_TAGGED, ""
+    if body:
+        reason = f"Searched {', '.join(body)}; no module named or implied"
+        if fetch_status and fetch_status not in FULL_TEXT_OK_STATUSES:
+            reason += f" (full text not searched: {FETCH_STATUS_TEXT.get(fetch_status, fetch_status)})"
+        return STATUS_NOT_REPORTED, reason
+    reason = "Only a title/identifier to search - no readable abstract or notes text"
+    if fetch_status is None:
+        reason += ", full-text download not enabled"
+    else:
+        reason += f", full text: {FETCH_STATUS_TEXT.get(fetch_status, fetch_status)}"
+    return STATUS_UNAVAILABLE, reason
+
+
 def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, tag_column=None,
-                     use_network_doi_lookup=True, use_semantic_matching=True,
+                     title_column=None, use_network_doi_lookup=True, use_semantic_matching=True,
                      fetch_full_text=False, full_text_pdf_pages=15, request_delay=0.5,
                      use_full_text_cache=True, semantic_matcher=None, session=None,
                      progress_callback=None, cancel_event=None):
@@ -673,7 +1114,10 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
     more than one) plus merge every tag found into `tag_column`.
     `text_columns` is an iterable of column names whose values are
     concatenated as the text to search (typically Title, Abstract, and/or
-    Notes/Extra).
+    Notes/Extra). `title_column`, if given, is the one of those that holds
+    only the title: a record whose only text is its title (or notes with
+    no readable prose, e.g. just "(ISSP)" or a link) is reported as
+    "Unavailable" rather than "Not reported" when nothing is found.
 
     Tier 1 (ZA number / GESIS DOI / exact module name) and tier 2 (scored
     keywords) run per-record first. Tier 3 (semantic similarity) then runs
@@ -698,10 +1142,17 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
 
     Independently of module classification, every record's search text
     (including any fetched full text) is scanned for ISSP member
-    countries mentioned near a data-source phrase (e.g. "data from
-    Germany and France") and tagged "DATA - <country>" in `tag_column`
-    and the "ISSP Data Countries" column - a paper can of course draw on
-    more than one country's data.
+    countries named in the same sentence as a data-source phrase (e.g.
+    "data from Germany and France") and tagged "DATA - <country>" in
+    `tag_column` and the "ISSP Data Countries" column - a paper can of
+    course draw on more than one country's data.
+
+    Every module tag and country comes with where it was found (which
+    column, or "Full text") and the sentence it was found in, so a reviewer
+    can check it without reopening the paper. A record with no module gets
+    a status that separates "Not reported" (there was an abstract/notes/
+    full text and it named no module) from "Unavailable" (there was
+    nothing but a title to read).
 
     The summary `counts` bucket each record by the single best confidence
     among the module tags it received (a record with both a high- and a
@@ -725,16 +1176,20 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
         tag_column = "Manual Tags"
         frame[tag_column] = ""
 
-    for column in ("ISSP Module Tag", "ISSP Module Confidence", "ISSP Module Method",
-                   "ISSP Module Evidence", "ISSP Data Countries", "ISSP Full Text Fetch Status"):
+    for column in ("ISSP Module Tag", "ISSP Module Confidence", "ISSP Module Status",
+                   "ISSP Module Status Reason", "ISSP Module Method", "ISSP Module Evidence",
+                   "ISSP Module Evidence Location", "ISSP Module Evidence Quote",
+                   "ISSP Data Countries", "ISSP Data Country Evidence",
+                   "ISSP Full Text Fetch Status"):
         frame[column] = ""
 
     counts = {"Total records": len(frame), "high confidence": 0, "medium confidence": 0,
-              "low confidence": 0, "no match": 0, "Cancelled records": 0,
+              "low confidence": 0, "not reported": 0,
+              "unavailable": 0, "Cancelled records": 0,
               "full text served from cache": 0, "full text freshly fetched": 0}
     total = len(frame)
     indices = list(frame.index)
-    texts, results, countries = {}, {}, {}
+    texts, segments_by_index, fetch_statuses, results, countries = {}, {}, {}, {}, {}
     finalize_indices = indices
 
     for completed, index in enumerate(indices, start=1):
@@ -742,12 +1197,17 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
             counts["Cancelled records"] += total - completed + 1
             remaining = indices[completed - 1:]
             frame.loc[remaining, "ISSP Module Confidence"] = "cancelled"
+            frame.loc[remaining, "ISSP Module Status"] = STATUS_CANCELLED
             finalize_indices = indices[:completed - 1]
             break
         row = frame.loc[index]
-        parts = [clean_value(row.get(column, "")) for column in text_columns]
+        parts = []
+        for column in text_columns:
+            value = clean_value(row.get(column, ""))
+            parts.append((column, value, column != title_column and has_readable_text(value)))
         if doi_column:
-            parts.append(clean_value(row.get(doi_column, "")))
+            parts.append((doi_column, clean_value(row.get(doi_column, "")), False))
+        fetch_status = None
         if fetch_full_text:
             link = abstract_tools.record_link(row, url_column, doi_column)
             if link:
@@ -765,14 +1225,16 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
                     if full_text_cache is not None:
                         full_text_cache[cache_key] = {"saved_at": time.time(), "payload": fetch_result}
                         append_full_text_cache_entry(cache_key, fetch_result)
-                frame.at[index, "ISSP Full Text Fetch Status"] = fetch_result.get("status", "")
-                parts.append(clean_value(fetch_result.get("full_text", "")))
+                fetch_status = fetch_result.get("status", "")
+                full_text = clean_value(fetch_result.get("full_text", ""))
+                parts.append((FULL_TEXT_LABEL, full_text, has_readable_text(full_text)))
             else:
-                frame.at[index, "ISSP Full Text Fetch Status"] = "no_link"
-        text = "\n".join(part for part in parts if part)
-        texts[index] = text
+                fetch_status = "no_link"
+            frame.at[index, "ISSP Full Text Fetch Status"] = fetch_status
+        text, segments = _join_labelled_parts(parts)
+        texts[index], segments_by_index[index], fetch_statuses[index] = text, segments, fetch_status
         results[index] = classify_record(text, doi_resolver=doi_resolver)
-        countries[index] = extract_data_countries(text)
+        countries[index] = extract_data_country_evidence(text)
         if progress_callback:
             best = results[index][0]["confidence"]
             progress_callback(completed, total, index, best)
@@ -795,6 +1257,7 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
                             "evidence": (f"Semantically similar to the {tag} module "
                                          f"description (similarity {similarity:.2f}), no "
                                          f"stronger evidence found"),
+                            "spans": [],
                         }
                         if len(results[index]) == 1 and results[index][0]["tag"] is None:
                             results[index] = [addition]
@@ -807,21 +1270,46 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
                                       f"semantic pass {start + len(chunk)}/{len(finalize_indices)}")
 
     for index in finalize_indices:
+        text, segments = texts[index], segments_by_index[index]
         items = results[index]
         matched = [item for item in items if item["tag"]]
         frame.at[index, "ISSP Module Tag"] = "; ".join(item["tag"] for item in matched)
         frame.at[index, "ISSP Module Confidence"] = "; ".join(item["confidence"] for item in matched)
+        status, reason = _status_for(matched, segments, fetch_statuses[index])
+        frame.at[index, "ISSP Module Status"] = status
+        frame.at[index, "ISSP Module Status Reason"] = reason
         if matched:
             frame.at[index, "ISSP Module Method"] = "; ".join(item["method"] for item in matched)
             frame.at[index, "ISSP Module Evidence"] = " | ".join(item["evidence"] for item in matched)
+            locations, quotes = [], []
+            for item in matched:
+                if item.get("spans"):
+                    labels, item_quotes = _evidence_location_and_quotes(text, segments, item["spans"])
+                    locations.append(f"{item['tag']}: {', '.join(labels)}")
+                    quotes.append(f"{item['tag']}: " + " / ".join(f"“{q}”" for q in item_quotes))
+                else:
+                    locations.append(f"{item['tag']}: {SEMANTIC_LOCATION}")
+            frame.at[index, "ISSP Module Evidence Location"] = " | ".join(locations)
+            frame.at[index, "ISSP Module Evidence Quote"] = " | ".join(quotes)
             counts[f"{matched[0]['confidence']} confidence"] += 1
         else:
             frame.at[index, "ISSP Module Method"] = items[0]["method"]
             frame.at[index, "ISSP Module Evidence"] = items[0]["evidence"]
-            counts["no match"] += 1
+            if status == STATUS_NOT_REPORTED:
+                counts["not reported"] += 1
+            else:
+                counts["unavailable"] += 1
 
-        found_countries = sorted(countries.get(index, ()))
+        found_countries = sorted(countries.get(index, {}))
         frame.at[index, "ISSP Data Countries"] = "; ".join(found_countries)
+        country_evidence = []
+        for country in found_countries:
+            sentence = countries[index][country]
+            segment = _segment_at(segments, sentence[0])
+            if segment is not None:
+                country_evidence.append(
+                    f"{country} [{segment[0]}]: “{_quote(text, sentence, segment)}”")
+        frame.at[index, "ISSP Data Country Evidence"] = " | ".join(country_evidence)
 
         current_tags = frame.at[index, tag_column]
         current_tags = replace_issp_module_tags(current_tags, [item["tag"] for item in matched])

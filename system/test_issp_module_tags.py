@@ -39,6 +39,12 @@ class FakeEmbeddingModel:
         return array
 
 
+# Long enough (MIN_READABLE_WORDS) to count as real text that was read.
+UNRELATED_ABSTRACT = ("This macroeconomics paper models how central bank interest rate "
+                      "decisions affect inflation expectations, bond yields, and investment "
+                      "across advanced economies over three decades.")
+
+
 def tags_of(results):
     return sorted(item["tag"] for item in results if item["tag"])
 
@@ -115,17 +121,32 @@ class IsspModuleTagsTests(unittest.TestCase):
         self.assertEqual(result["confidence"], "high")
         self.assertEqual(result["method"], "exact_module_name")
 
-    def test_generic_name_alone_is_not_promoted_to_high(self):
-        # "Religion" alone is ordinary vocabulary - must not be treated as
-        # an exact-name hit without an ISSP mention nearby.
-        result = tagger.classify_record(
-            "This paper is broadly about religion in modern society.")
+    def test_religion_environment_social_networks_count_standalone(self):
+        for text, expected in [
+                ("This paper is broadly about religion in modern society.", "RELIG"),
+                ("Attitudes toward the environment in Europe.", "ENV"),
+                ("Social networks and wellbeing in later life.", "SOCNET")]:
+            result = first(tagger.classify_record(text))
+            self.assertEqual(result["tag"], expected)
+            self.assertEqual(result["confidence"], "high")
+            self.assertEqual(result["method"], "exact_module_name")
+
+    def test_exact_name_needs_whole_word(self):
+        # "environmental" must not count as the module name "environment".
+        result = tagger.classify_record("A short note on environmental law.")
         self.assertEqual(tags_of(result), [])
+
+    def test_generic_name_alone_is_not_promoted_to_high(self):
+        # "Citizenship" / "National Identity" alone are ordinary vocabulary
+        # - must not be treated as an exact-name hit without ISSP nearby.
+        for text in ["This paper is broadly about citizenship in modern society.",
+                     "This paper is broadly about national identity in Asia."]:
+            self.assertEqual(tags_of(tagger.classify_record(text)), [])
 
     def test_generic_name_near_issp_is_high_confidence(self):
         result = first(tagger.classify_record(
-            "This paper uses the ISSP Religion module for its analysis."))
-        self.assertEqual(result["tag"], "RELIG")
+            "This paper uses the ISSP Citizenship module for its analysis."))
+        self.assertEqual(result["tag"], "CIT")
         self.assertEqual(result["confidence"], "high")
         self.assertEqual(result["method"], "exact_module_name")
 
@@ -134,18 +155,18 @@ class IsspModuleTagsTests(unittest.TestCase):
         # of using the acronym - this must count just as much as "ISSP".
         result = first(tagger.classify_record(
             "This study uses the International Social Survey Programme "
-            "Religion module for its analysis."))
-        self.assertEqual(result["tag"], "RELIG")
+            "National Identity module for its analysis."))
+        self.assertEqual(result["tag"], "NATID")
         self.assertEqual(result["confidence"], "high")
         self.assertEqual(result["method"], "exact_module_name")
 
         result = first(tagger.classify_record(
             "This study uses the International Social Survey Program "
-            "Religion module for its analysis."))  # American spelling
-        self.assertEqual(result["tag"], "RELIG")
+            "National Identity module for its analysis."))  # American spelling
+        self.assertEqual(result["tag"], "NATID")
 
     def test_generic_name_far_from_issp_does_not_count(self):
-        far_text = "ISSP data. " + ("filler word " * 40) + "This is about religion."
+        far_text = "ISSP data. " + ("filler word " * 40) + "This is about citizenship."
         result = tagger.classify_record(far_text)
         self.assertEqual(tags_of(result), [])
 
@@ -332,7 +353,7 @@ class IsspModuleTagsTests(unittest.TestCase):
             "Abstract": [
                 "Uses ZA7570 dataset.",
                 "A study of environmental attitude and pro-environmental behaviour.",
-                "Unrelated macroeconomics paper.",
+                UNRELATED_ABSTRACT,
             ],
             "DOI": ["10.1/aaa", "10.2/bbb", "10.3/ccc"],
             "Keywords": ["EXISTINGTAG", "", "OTHERTAG"],
@@ -356,7 +377,97 @@ class IsspModuleTagsTests(unittest.TestCase):
         self.assertEqual(stats["Total records"], 3)
         self.assertEqual(stats["high confidence"], 1)
         self.assertEqual(stats["medium confidence"], 1)
-        self.assertEqual(stats["no match"], 1)
+        self.assertEqual(stats["not reported"], 1)
+
+    def test_status_separates_not_reported_from_unavailable(self):
+        df = pd.DataFrame({
+            "Title": ["Paper A", "Paper B", "Paper C"],
+            "Abstract": ["Uses ZA7570 dataset.", UNRELATED_ABSTRACT, ""],
+        })
+        output_df, stats, _tag_column = tagger.tag_issp_modules(
+            df, text_columns=["Title", "Abstract"], title_column="Title",
+            use_network_doi_lookup=False, use_semantic_matching=False)
+        self.assertEqual(list(output_df["ISSP Module Status"]),
+                         ["Tagged", "Not reported", "Unavailable"])
+        self.assertIn("Searched Abstract", output_df.loc[1, "ISSP Module Status Reason"])
+        self.assertIn("full-text download not enabled", output_df.loc[2, "ISSP Module Status Reason"])
+        self.assertEqual(stats["not reported"], 1)
+        self.assertEqual(stats["unavailable"], 1)
+
+    def test_marker_only_notes_are_not_readable_text(self):
+        self.assertFalse(tagger.has_readable_text("<p>(ISSP)</p>"))
+        self.assertFalse(tagger.has_readable_text(
+            "<p>Export Date: 24 November 2025; Cited By: 3</p>\n<p>(ISSP) (EVS)</p>"))
+        self.assertFalse(tagger.has_readable_text(
+            "<p>http://search.proquest.com/docview/886579133?accountid=14657</p>"))
+        self.assertTrue(tagger.has_readable_text(UNRELATED_ABSTRACT))
+
+        df = pd.DataFrame({"Title": ["Paper A"], "Abstract": [""], "Notes": ["<p>(ISSP)</p>"]})
+        output_df, _stats, _tag_column = tagger.tag_issp_modules(
+            df, text_columns=["Title", "Abstract", "Notes"], title_column="Title",
+            use_network_doi_lookup=False, use_semantic_matching=False)
+        self.assertEqual(output_df.loc[0, "ISSP Module Status"], "Unavailable")
+
+    def test_failed_full_text_with_title_only_is_unavailable(self):
+        df = pd.DataFrame({"Title": ["Paper A"], "Abstract": [""],
+                           "Url": ["https://example.org/paper"]})
+        with mock.patch.object(tagger.abstract_tools, "fetch_abstract",
+                               return_value={"status": "fetch_failed", "full_text": ""}):
+            output_df, _stats, _tag_column = tagger.tag_issp_modules(
+                df, text_columns=["Title", "Abstract"], title_column="Title", url_column="Url",
+                use_network_doi_lookup=False, use_semantic_matching=False,
+                fetch_full_text=True, use_full_text_cache=False, request_delay=0)
+        self.assertEqual(output_df.loc[0, "ISSP Module Status"], "Unavailable")
+        self.assertIn("download failed", output_df.loc[0, "ISSP Module Status Reason"])
+
+    def test_evidence_location_and_quote_name_the_field_and_sentence(self):
+        df = pd.DataFrame({
+            "Title": ["Attitudes in Europe"],
+            "Abstract": ["Background text. We analyse ZA7570 for twelve countries. More text."],
+            "Notes": ["Also mentions job satisfaction and work commitment."],
+        })
+        output_df, _stats, _tag_column = tagger.tag_issp_modules(
+            df, text_columns=["Title", "Abstract", "Notes"], title_column="Title",
+            use_network_doi_lookup=False, use_semantic_matching=False)
+        self.assertEqual(output_df.loc[0, "ISSP Module Tag"], "RELIG; WORKORI")
+        self.assertEqual(output_df.loc[0, "ISSP Module Evidence Location"],
+                         "RELIG: Abstract | WORKORI: Notes")
+        self.assertEqual(
+            output_df.loc[0, "ISSP Module Evidence Quote"],
+            "RELIG: “We analyse ZA7570 for twelve countries.” | "
+            "WORKORI: “Also mentions job satisfaction and work commitment.”")
+
+    def test_semantic_tag_location_is_whole_text(self):
+        class FakeMatcher:
+            def classify_batch(self, texts):
+                return [("HLTH", 0.6) for _ in texts]
+
+        df = pd.DataFrame({"Title": ["Paper A"], "Abstract": ["Nothing specific here."]})
+        output_df, _stats, _tag_column = tagger.tag_issp_modules(
+            df, text_columns=["Title", "Abstract"], use_network_doi_lookup=False,
+            semantic_matcher=FakeMatcher())
+        self.assertEqual(output_df.loc[0, "ISSP Module Evidence Location"],
+                         "HLTH: " + tagger.SEMANTIC_LOCATION)
+        self.assertEqual(output_df.loc[0, "ISSP Module Evidence Quote"], "")
+
+    def test_long_sentence_quote_is_shortened_around_the_match(self):
+        long_sentence = ("word " * 100) + "ZA7570" + (" word" * 100) + "."
+        df = pd.DataFrame({"Abstract": [long_sentence]})
+        output_df, _stats, _tag_column = tagger.tag_issp_modules(
+            df, text_columns=["Abstract"], use_network_doi_lookup=False,
+            use_semantic_matching=False)
+        quote = output_df.loc[0, "ISSP Module Evidence Quote"]
+        self.assertIn("ZA7570", quote)
+        self.assertLess(len(quote), tagger.MAX_QUOTE_CHARS + 20)
+
+    def test_country_evidence_column(self):
+        df = pd.DataFrame({"Abstract": ["Other papers are based on Japan. This paper uses UK data."]})
+        output_df, _stats, _tag_column = tagger.tag_issp_modules(
+            df, text_columns=["Abstract"], use_network_doi_lookup=False,
+            use_semantic_matching=False)
+        self.assertEqual(output_df.loc[0, "ISSP Data Countries"], "Great Britain")
+        self.assertEqual(output_df.loc[0, "ISSP Data Country Evidence"],
+                         "Great Britain [Abstract]: “This paper uses UK data.”")
 
     def test_tag_issp_modules_records_multiple_tags_semicolon_separated(self):
         df = pd.DataFrame({
@@ -432,7 +543,7 @@ class IsspModuleTagsTests(unittest.TestCase):
         self.assertEqual(output_df.loc[1, "ISSP Module Method"], "semantic_similarity")
         self.assertEqual(stats["high confidence"], 1)  # paper A's best is still high
         self.assertEqual(stats["low confidence"], 1)   # paper B is low (semantic only)
-        self.assertEqual(stats["no match"], 0)
+        self.assertEqual(stats["not reported"] + stats["unavailable"], 0)
 
     def test_tag_issp_modules_semantic_pass_skipped_when_disabled(self):
         class MatcherThatShouldNotBeCalled:
@@ -441,13 +552,13 @@ class IsspModuleTagsTests(unittest.TestCase):
 
         df = pd.DataFrame({
             "Title": ["Paper A"],
-            "Abstract": ["An abstract with no ISSP mention or matching keywords at all."],
+            "Abstract": [UNRELATED_ABSTRACT],
         })
         output_df, stats, _tag_column = tagger.tag_issp_modules(
             df, text_columns=["Title", "Abstract"], use_network_doi_lookup=False,
             use_semantic_matching=False, semantic_matcher=MatcherThatShouldNotBeCalled())
         self.assertEqual(output_df.loc[0, "ISSP Module Method"], "no_evidence")
-        self.assertEqual(stats["no match"], 1)
+        self.assertEqual(stats["not reported"], 1)
 
     # --- country/data-source tags -----------------------------------------
 
@@ -458,8 +569,82 @@ class IsspModuleTagsTests(unittest.TestCase):
 
     def test_country_mentioned_near_spelled_out_issp_name_is_extracted(self):
         result = tagger.extract_data_countries(
-            "This uses the International Social Survey Programme. Germany was included.")
+            "This uses the International Social Survey Programme for Germany.")
         self.assertEqual(result, {"Germany"})
+
+    def test_country_in_previous_sentence_does_not_count(self):
+        # Japan is only in the sentence about someone else's paper; the
+        # data phrase is in the next sentence.
+        result = tagger.extract_data_countries(
+            "Other papers are based on Japan. This paper uses UK data.")
+        self.assertEqual(result, {"Great Britain"})
+        result = tagger.extract_data_countries(
+            "Earlier work studied Germany. We use data from the ISSP 2018 wave.")
+        self.assertEqual(result, set())
+
+    def test_title_and_abstract_are_separate_sentences(self):
+        # Fields are joined with newlines, so a country at the end of the
+        # title never pairs with a data phrase at the start of the abstract.
+        result = tagger.extract_data_countries("Religion in Poland\nData from 30 countries.")
+        self.assertEqual(result, set())
+
+    def test_abbreviations_do_not_split_a_sentence(self):
+        result = tagger.extract_data_countries(
+            "We use data from the U.S. and e.g. Germany in 2018.")
+        self.assertEqual(result, {"USA", "Germany"})
+
+    def test_country_followed_by_data_noun_counts(self):
+        self.assertEqual(tagger.extract_data_countries("We analyse Swiss and Japan survey waves."),
+                         {"Switzerland", "Japan"})
+        self.assertEqual(tagger.extract_data_countries("The UK's survey data."), {"Great Britain"})
+        self.assertEqual(tagger.extract_data_countries("Using UK household panel data."),
+                         {"Great Britain"})
+
+    def test_bare_us_only_counts_in_capitals(self):
+        self.assertEqual(tagger.extract_data_countries("Data from US respondents."), {"USA"})
+        self.assertEqual(tagger.extract_data_countries("Give us data from them."), set())
+
+    def test_nationality_adjective_needs_a_data_noun(self):
+        self.assertEqual(tagger.extract_data_countries("We use German respondents from ALLBUS."),
+                         {"Germany"})
+        self.assertEqual(tagger.extract_data_countries(
+            "Using the Chinese General Social Survey 2010."), {"China"})
+        self.assertEqual(tagger.extract_data_countries(
+            "We analyse East German and West German samples."), {"Germany"})
+        # An adjective next to a data phrase is not enough on its own.
+        self.assertEqual(tagger.extract_data_countries("Data from the German economy."), set())
+
+    def test_person_named_german_is_not_a_country(self):
+        # "German" is also a first name / surname - a possessive between
+        # the adjective and the data noun means it is a person.
+        self.assertEqual(tagger.extract_data_countries("Data from German Lopez's survey."), set())
+
+    def test_non_issp_member_countries_are_tagged(self):
+        self.assertEqual(tagger.extract_data_countries("This paper uses data from China and Brazil."),
+                         {"China", "Brazil"})
+        self.assertIn("China", tagger.ALL_COUNTRIES)
+        self.assertGreater(len(tagger.ALL_COUNTRIES), 190)
+
+    def test_longest_country_name_wins(self):
+        self.assertEqual(tagger.extract_data_countries(
+            "Data from Northern Ireland and Papua New Guinea."),
+            {"Northern Ireland", "Papua New Guinea"})
+        self.assertEqual(tagger.extract_data_countries("Data from South Sudan."), {"South Sudan"})
+
+    def test_region_words_are_not_countries(self):
+        self.assertEqual(tagger.extract_data_countries(
+            "Data from Latin America and North American respondents."), set())
+        self.assertEqual(tagger.extract_data_countries(
+            "African American respondents in the survey."), set())
+
+    def test_case_sensitive_codes(self):
+        self.assertEqual(tagger.extract_data_countries("Survey data from the PRC and UAE."),
+                         {"China", "United Arab Emirates"})
+
+    def test_country_evidence_returns_the_sentence(self):
+        text = "Other papers are based on Japan. This paper uses UK data."
+        start, end = tagger.extract_data_country_evidence(text)["Great Britain"]
+        self.assertEqual(text[start:end], "This paper uses UK data.")
 
     def test_country_mentioned_without_data_context_is_not_extracted(self):
         # This is a literature-review-style citation of someone else's

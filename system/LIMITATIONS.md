@@ -156,7 +156,26 @@ ambiguous records.
   these states into one negative category.
 - An `Approve` decision answers a review-inclusion question; verification answers
   a link-to-paper identity question. They are not interchangeable labels.
-- Future IST module extraction would be a separate semantic task. It should save
-  quoted evidence, location, source, extraction method, and uncertainty, with
-  distinct `Not reported` and `Unavailable` states rather than treating missing
-  evidence as absence.
+- ISSP Module Tags saves, for every module tag, the method, confidence, field
+  it was found in, and the quoted sentence, and separates `Not reported` (an
+  abstract, notes, or full text was read and named no module) from
+  `Unavailable` (only a title, or notes such as "(ISSP)", were available).
+  `Not reported` is still not proof that no module was used: an abstract often
+  omits it, and only downloaded full text reaches the Methods section.
+  Meaning-based (semantic) tags have no quote because they judge the whole text.
+- Data-country tags cover about 200 countries and territories. A country
+  name needs a data phrase ("data from", "sample of", "ISSP") or a following
+  data word ("UK data") in the same sentence; a nationality adjective needs a
+  following data word ("German respondents"), because "German" is also a
+  personal name. Ambiguous names remain: "Georgia" can be the US state and
+  "Jordan" a person. "English" is not treated as an adjective for England
+  (it is usually the language). Sentence splitting is heuristic: unusual
+  abbreviations can join or split sentences incorrectly.
+- `semantic_model_comparison.py` scores embedding models against records
+  that already have a ZA number or exact module name, with that evidence
+  masked out. These are silver labels (exact-name matching has false
+  positives), so the ranking between models is more reliable than the
+  absolute accuracy figures. Language is estimated from English function
+  words, not detected properly.
+- Question-level extraction (mapping a paper to specific ISSP variables or
+  questions) is not implemented.
