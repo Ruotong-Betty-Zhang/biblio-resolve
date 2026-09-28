@@ -717,9 +717,13 @@ class NoteLinkRecoveryPage(ctk.CTkFrame):
         ctk.CTkButton(top, text="Choose file…", width=130, command=self.on_choose_file).pack(side="left")
         self.file_label = ctk.CTkLabel(top, text="Choose CSV, Excel, RIS, BibTeX, or CSL JSON", anchor="w")
         self.file_label.pack(side="left", padx=12, fill="x", expand=True)
-        self.export_btn = ctk.CTkButton(top, text="Export enriched copy…", width=170,
+
+        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        export_row.pack(fill="x", padx=4, pady=(0, 8))
+        self.output_format = _add_export_format_menu(export_row)
+        self.export_btn = ctk.CTkButton(export_row, text="Export enriched copy…", width=170,
                                         command=self.on_export, state="disabled")
-        self.export_btn.pack(side="right")
+        self.export_btn.pack(side="left")
 
         settings = ctk.CTkFrame(self)
         settings.pack(fill="x", padx=4, pady=(0, 8))
@@ -830,7 +834,8 @@ class NoteLinkRecoveryPage(ctk.CTkFrame):
     def on_export(self):
         if self.output_df is None:
             return
-        _save_enriched_dataframe(self, self.output_df, self.file_path, "note_links")
+        _save_enriched_dataframe(self, self.output_df, self.file_path, "note_links",
+                                 format_label=self.output_format.get())
 
 
 # ---------------------------------------------------------------------------
@@ -852,9 +857,13 @@ class AbstractFinderPage(ctk.CTkFrame):
         ctk.CTkButton(top, text="Choose file…", width=130, command=self.on_choose_file).pack(side="left")
         self.file_label = ctk.CTkLabel(top, text="Choose a Zotero-compatible bibliographic file", anchor="w")
         self.file_label.pack(side="left", padx=12, fill="x", expand=True)
-        self.export_btn = ctk.CTkButton(top, text="Export with abstracts…", width=170,
+
+        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        export_row.pack(fill="x", padx=4, pady=(0, 8))
+        self.output_format = _add_export_format_menu(export_row)
+        self.export_btn = ctk.CTkButton(export_row, text="Export with abstracts…", width=170,
                                         command=self.on_export, state="disabled")
-        self.export_btn.pack(side="right")
+        self.export_btn.pack(side="left")
 
         identity_settings = ctk.CTkFrame(self)
         identity_settings.pack(fill="x", padx=4, pady=(0, 6))
@@ -1059,18 +1068,46 @@ class AbstractFinderPage(ctk.CTkFrame):
 
     def on_export(self):
         if self.output_df is not None:
-            _save_enriched_dataframe(self, self.output_df, self.file_path, "abstracts")
+            _save_enriched_dataframe(self, self.output_df, self.file_path, "abstracts",
+                                     format_label=self.output_format.get())
 
 
-def _save_enriched_dataframe(parent, dataframe, source_path, suffix):
+SAME_AS_SOURCE_FORMAT = "Same as source"
+
+
+def _export_format_values():
+    """Values for every page's "Export format" dropdown: "Same as source"
+    (keeps writing whatever format the loaded file was in - the long-
+    standing default) followed by every explicit format core.write_records_file
+    supports, so a page's exported copy can be forced to a different
+    format than what was loaded."""
+    return [SAME_AS_SOURCE_FORMAT] + list(core.OUTPUT_FORMATS.keys())
+
+
+def _add_export_format_menu(parent, width=170):
+    """Label + CTkOptionMenu pair for "which format to export as", packed
+    left-to-right into `parent`. Returns the CTkOptionMenu; read its
+    .get() and pass it as `_save_enriched_dataframe`'s `format_label`."""
+    ctk.CTkLabel(parent, text="Export format").pack(side="left", padx=(0, 8))
+    menu = ctk.CTkOptionMenu(parent, values=_export_format_values(), width=width)
+    menu.set(SAME_AS_SOURCE_FORMAT)
+    menu.pack(side="left", padx=(0, 10))
+    return menu
+
+
+def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_label=None):
     base = os.path.splitext(os.path.basename(source_path or "records"))[0]
     source_label = core.preferred_output_format_label(source_path)
-    default_format, default_ext = core.OUTPUT_FORMATS[source_label]
-    filetypes = [(f"Same format as source ({source_label})", f"*{default_ext}")]
+    chosen_label = format_label if format_label and format_label != SAME_AS_SOURCE_FORMAT else None
+    default_label = chosen_label or source_label
+    default_format, default_ext = core.OUTPUT_FORMATS[default_label]
+    default_display = (f"{default_label} (chosen above)" if chosen_label
+                        else f"Same format as source ({source_label})")
+    filetypes = [(default_display, f"*{default_ext}")]
     filetypes.extend(
         (label, f"*{extension}")
         for label, (_format, extension) in core.OUTPUT_FORMATS.items()
-        if label != source_label
+        if label != default_label
     )
     path = filedialog.asksaveasfilename(
         title="Export enriched records", defaultextension=default_ext,
@@ -1088,12 +1125,17 @@ def _save_enriched_dataframe(parent, dataframe, source_path, suffix):
     messagebox.showinfo("Export complete", f"Saved to:\n{path}")
 
 
-def _export_table_rows(parent, rows, headers, default_name):
+def _export_table_rows(parent, rows, headers, default_name, format_label=None):
     """Export an arbitrary computed table (stats counts, a diff table — not
     a bibliography with a "same format as source" concept) to CSV or Excel."""
+    want_excel = (format_label or "").startswith("Excel")
+    default_ext = ".xlsx" if want_excel else ".csv"
+    filetypes = ([("Excel (.xlsx)", "*.xlsx"), ("CSV table (.csv)", "*.csv")] if want_excel else
+                 [("CSV table (.csv)", "*.csv"), ("Excel (.xlsx)", "*.xlsx")])
+    default_name = os.path.splitext(default_name)[0] + default_ext
     path = filedialog.asksaveasfilename(
-        title="Export table", defaultextension=".csv",
-        filetypes=[("CSV table (.csv)", "*.csv"), ("Excel (.xlsx)", "*.xlsx")],
+        title="Export table", defaultextension=default_ext,
+        filetypes=filetypes,
         initialfile=default_name)
     if not path:
         return
@@ -1157,9 +1199,13 @@ class IsspModulePage(ctk.CTkFrame):
         ctk.CTkButton(top, text="Choose file…", width=130, command=self.on_choose_file).pack(side="left")
         self.file_label = ctk.CTkLabel(top, text="Choose a Zotero-compatible bibliographic file", anchor="w")
         self.file_label.pack(side="left", padx=12, fill="x", expand=True)
-        self.export_btn = ctk.CTkButton(top, text="Export with module tags…", width=185,
+
+        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        export_row.pack(fill="x", padx=4, pady=(0, 8))
+        self.output_format = _add_export_format_menu(export_row)
+        self.export_btn = ctk.CTkButton(export_row, text="Export with module tags…", width=185,
                                         command=self.on_export, state="disabled")
-        self.export_btn.pack(side="right")
+        self.export_btn.pack(side="left")
 
         mapping_top = ctk.CTkFrame(self)
         mapping_top.pack(fill="x", padx=4, pady=(0, 4))
@@ -1398,9 +1444,13 @@ class TagCleanupPage(ctk.CTkFrame):
         self.clean_btn = ctk.CTkButton(settings, text="Preview cleanup", width=140,
                                        command=self.on_clean, state="disabled")
         self.clean_btn.pack(side="left", pady=10)
-        self.export_btn = ctk.CTkButton(settings, text="Export cleaned copy…", width=170,
+
+        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        export_row.pack(fill="x", padx=12, pady=(0, 8))
+        self.output_format = _add_export_format_menu(export_row)
+        self.export_btn = ctk.CTkButton(export_row, text="Export cleaned copy…", width=170,
                                         command=self.on_export, state="disabled")
-        self.export_btn.pack(side="right", padx=12, pady=10)
+        self.export_btn.pack(side="left")
 
         rules = ctk.CTkFrame(self)
         rules.pack(fill="x", padx=12, pady=(0, 8))
@@ -1503,32 +1553,8 @@ class TagCleanupPage(ctk.CTkFrame):
     def on_export(self):
         if self.output_df is None:
             return
-        source_ext = os.path.splitext(self.file_path)[1].lower()
-        source_formats = {
-            ".csv": ("csv", ".csv"),
-            ".xlsx": ("excel", ".xlsx"), ".xls": ("excel", ".xlsx"),
-            ".ris": ("ris", ".ris"), ".bib": ("bibtex", ".bib"),
-            ".bibtex": ("bibtex", ".bibtex"),
-        }
-        fmt, ext = source_formats.get(source_ext, ("csv", ".csv"))
-        base = os.path.splitext(os.path.basename(self.file_path))[0]
-        path = filedialog.asksaveasfilename(
-            title="Export cleaned keyword file", defaultextension=ext,
-            filetypes=[
-                ("Same format as source", f"*{ext}"), ("CSV", "*.csv"),
-                ("Excel", "*.xlsx"), ("RIS", "*.ris"),
-                ("BibTeX / BibLaTeX", "*.bib *.bibtex")],
-            initialfile=f"{base}_keywords_cleaned{ext}")
-        if not path:
-            return
-        selected_ext = os.path.splitext(path)[1].lower()
-        fmt = source_formats.get(selected_ext, (fmt, selected_ext or ext))[0]
-        try:
-            core.write_records_file(self.output_df, path, fmt)
-        except Exception as exc:
-            messagebox.showerror("Save failed", f"Couldn't save the file:\n{exc}")
-            return
-        messagebox.showinfo("Saved", f"Cleaned copy saved to:\n{path}")
+        _save_enriched_dataframe(self, self.output_df, self.file_path, "keywords_cleaned",
+                                 format_label=self.output_format.get())
 
 
 # ---------------------------------------------------------------------------
@@ -1565,13 +1591,25 @@ class ManualReviewPage(ctk.CTkFrame):
                       command=self.on_choose_file).pack(side="left")
         self.file_label = ctk.CTkLabel(top, text="No file loaded — this page does not call any API", anchor="w")
         self.file_label.pack(side="left", padx=12, fill="x", expand=True)
-        self.save_btn = ctk.CTkButton(top, text="Save reviewed copy…", width=160,
+
+        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        export_row.pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkLabel(export_row, text="Export format").pack(side="left", padx=(0, 8))
+        # Manual Review adds free-form extra columns (Manual Decision,
+        # verification metadata, ...) that only a flat table can hold
+        # without loss, so - unlike the other pages - this is CSV/Excel
+        # only, not the full RIS/BibTeX/CSL JSON set.
+        self.output_format = ctk.CTkOptionMenu(
+            export_row, values=["CSV table (.csv)", "Excel (.xlsx)"], width=170)
+        self.output_format.set("CSV table (.csv)")
+        self.output_format.pack(side="left", padx=(0, 10))
+        self.save_btn = ctk.CTkButton(export_row, text="Save reviewed copy…", width=160,
                                       command=self.on_save, state="disabled")
-        self.save_btn.pack(side="right")
+        self.save_btn.pack(side="left")
         self.save_filtered_btn = ctk.CTkButton(
-            top, text="Save filtered results…", width=165,
+            export_row, text="Save filtered results…", width=165,
             command=self.on_save_filtered, state="disabled")
-        self.save_filtered_btn.pack(side="right", padx=(0, 8))
+        self.save_filtered_btn.pack(side="left", padx=(8, 0))
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=4)
@@ -2084,10 +2122,13 @@ class ManualReviewPage(ctk.CTkFrame):
 
     def _save_dataframe(self, dataframe, dialog_title, filename_suffix, saved_label):
         base = os.path.splitext(os.path.basename(self.file_path or "records"))[0]
+        want_excel = self.output_format.get().startswith("Excel")
+        default_ext = ".xlsx" if want_excel else ".csv"
+        filetypes = [("Excel", "*.xlsx"), ("CSV", "*.csv")] if want_excel else [("CSV", "*.csv"), ("Excel", "*.xlsx")]
         path = filedialog.asksaveasfilename(
-            title=dialog_title, defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx")],
-            initialfile=f"{base}_{filename_suffix}.csv")
+            title=dialog_title, defaultextension=default_ext,
+            filetypes=filetypes,
+            initialfile=f"{base}_{filename_suffix}{default_ext}")
         if not path:
             return
         try:
@@ -4514,9 +4555,17 @@ class CompareDocumentsPage(ctk.CTkFrame):
         self.ignore_case_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(run_row, text="Ignore case & punctuation in compared values",
                         variable=self.ignore_case_var).pack(side="left", padx=14)
-        self.export_btn = ctk.CTkButton(run_row, text="Export shown records…", width=170,
+
+        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        export_row.pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(export_row, text="Export format").pack(side="left", padx=(0, 8))
+        self.output_format = ctk.CTkOptionMenu(
+            export_row, values=["CSV table (.csv)", "Excel (.xlsx)"], width=170)
+        self.output_format.set("CSV table (.csv)")
+        self.output_format.pack(side="left", padx=(0, 10))
+        self.export_btn = ctk.CTkButton(export_row, text="Export shown records…", width=170,
                                         command=self.on_export, state="disabled")
-        self.export_btn.pack(side="right")
+        self.export_btn.pack(side="left")
         self.status_var = ctk.StringVar(
             value="Choose both files, pick the match columns and the columns to compare, then click Compare.")
         ctk.CTkLabel(self, textvariable=self.status_var, anchor="w", justify="left",
@@ -4828,7 +4877,7 @@ class CompareDocumentsPage(ctk.CTkFrame):
         if self.visible_records:
             headers, rows = compare_tools.comparison_export_rows(
                 self.visible_records, self.summary["compared_labels"])
-            _export_table_rows(self, rows, headers, "comparison.csv")
+            _export_table_rows(self, rows, headers, "comparison.csv", format_label=self.output_format.get())
 
 
 # ---------------------------------------------------------------------------
@@ -4931,9 +4980,13 @@ class TranslatePage(ctk.CTkFrame):
         ctk.CTkButton(top, text="⚙ Settings…", width=110, command=self.on_open_settings).pack(side="right")
         ctk.CTkButton(top, text="🗑 Clear cache…", width=130, command=self.on_clear_cache).pack(
             side="right", padx=(0, 6))
-        self.export_btn = ctk.CTkButton(top, text="Export translated copy…", width=190,
+
+        export_row = ctk.CTkFrame(self, fg_color="transparent")
+        export_row.pack(fill="x", padx=4, pady=(0, 8))
+        self.output_format = _add_export_format_menu(export_row)
+        self.export_btn = ctk.CTkButton(export_row, text="Export translated copy…", width=190,
                                         command=self.on_export, state="disabled")
-        self.export_btn.pack(side="right", padx=(0, 6))
+        self.export_btn.pack(side="left")
 
         mapping = ctk.CTkFrame(self)
         mapping.pack(fill="x", padx=4, pady=(0, 4))
@@ -5161,7 +5214,8 @@ class TranslatePage(ctk.CTkFrame):
 
     def on_export(self):
         if self.output_df is not None:
-            _save_enriched_dataframe(self, self.output_df, self.file_path, "translated")
+            _save_enriched_dataframe(self, self.output_df, self.file_path, "translated",
+                                     format_label=self.output_format.get())
 
 
 # ---------------------------------------------------------------------------
