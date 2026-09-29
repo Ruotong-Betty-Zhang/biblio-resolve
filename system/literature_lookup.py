@@ -143,11 +143,18 @@ def _set_readonly_text_autosize(textbox, value, min_height=90, max_height=280, l
     max_height) instead of leaving it at a fixed height the user has to drag
     open or scroll through by hand."""
     _set_readonly_text(textbox, value)
-    # Only an unmapped box needs a full layout pass to learn its width; once
-    # shown, "update" makes the count wrap lines itself. update_idletasks()
-    # would re-lay-out (and redraw the scrollbars of) the whole window.
-    if textbox.winfo_width() <= 1:
-        textbox.update_idletasks()
+    _fit_readonly_text_height(textbox, min_height, max_height, line_height)
+
+
+def _fit_readonly_text_height(textbox, min_height, max_height, line_height):
+    if not textbox.winfo_exists():
+        return
+    if not textbox.winfo_ismapped() or textbox.winfo_width() <= 1:
+        # Not on screen yet (e.g. a dialog's first record): its width is
+        # unknown, so every word would count as a wrapped line and the box
+        # would open at max_height. Measure once it has been laid out.
+        textbox.after(80, lambda: _fit_readonly_text_height(textbox, min_height, max_height, line_height))
+        return
     try:
         lines = textbox._textbox.count("1.0", "end", "update", "displaylines")
         if isinstance(lines, (tuple, list)):  # an int when "update" is passed
@@ -2391,11 +2398,13 @@ class ManualReviewDialog(ctk.CTkToplevel):
         self.all_fields_frame = ctk.CTkScrollableFrame(self, height=300)
         self.all_fields_frame.grid_columnconfigure(1, weight=1)
 
+        # Compact: label beside the text, and the box only as tall as the
+        # message (one line for "The URL returned HTTP 403", up to five).
         message_frame = ctk.CTkFrame(self)
-        ctk.CTkLabel(message_frame, text="Verification message",
-                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(7, 2))
-        self.message_box = ctk.CTkTextbox(message_frame, height=70, wrap="word", font=ctk.CTkFont(size=13))
-        self.message_box.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(message_frame, text="Verification\nmessage", justify="left", anchor="nw",
+                     font=ctk.CTkFont(weight="bold")).pack(side="left", anchor="n", padx=(10, 6), pady=7)
+        self.message_box = ctk.CTkTextbox(message_frame, height=34, wrap="word", font=ctk.CTkFont(size=13))
+        self.message_box.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=6)
 
         editor = ctk.CTkFrame(self)
         ctk.CTkLabel(editor, text="Review state", font=ctk.CTkFont(weight="bold")).grid(
@@ -2927,8 +2936,10 @@ class ManualReviewDialog(ctk.CTkToplevel):
         if conflicts:
             summary += f"   |   Conflicts: {conflicts}"
         self.status_label.configure(text=summary)
-        _set_readonly_text_autosize(self.message_box, self._column_value(row, [], ("Verification Message",)) or
-                           "No verification message is stored in this file.")
+        _set_readonly_text_autosize(
+            self.message_box, self._column_value(row, [], ("Verification Message",)) or
+            "No verification message is stored in this file.",
+            min_height=34, max_height=120, line_height=20)
         if self.review_page.lookup_status_column:
             state = next(
                 (label for label, (status_value, _) in self.REVIEW_STATES.items()
