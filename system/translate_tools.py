@@ -338,17 +338,28 @@ def _translate_deepl(texts, target_lang, api_key, source_lang, session):
     if not indices:
         return results
     session = session or requests.Session()
-    endpoint = DEEPL_FREE_ENDPOINT if api_key.strip().endswith(":fx") else DEEPL_PRO_ENDPOINT
-    data = [("auth_key", api_key), ("target_lang", target_lang.upper())]
+    api_key = api_key.strip()
+    free_key = api_key.endswith(":fx")
+    endpoint = DEEPL_FREE_ENDPOINT if free_key else DEEPL_PRO_ENDPOINT
+    # DeepL retired the auth_key form/query parameter; the key now has to be
+    # sent in the Authorization header, otherwise every request gets 403.
+    headers = {"Authorization": f"DeepL-Auth-Key {api_key}"}
+    data = [("target_lang", target_lang.upper())]
     data += [("text", texts[i]) for i in indices]
     if source_lang:
         data.append(("source_lang", source_lang.upper()))
     try:
-        response = session.post(endpoint, data=data, timeout=20)
+        response = session.post(endpoint, data=data, headers=headers, timeout=20)
     except requests.RequestException as exc:
         raise TranslationError(f"Network error contacting DeepL: {exc}") from exc
     if response.status_code == 403:
-        raise TranslationError("DeepL rejected the API key (403 Forbidden). Check the key.")
+        plan = "Free (ends in :fx, sent to api-free.deepl.com)" if free_key else \
+            "Pro (no :fx suffix, sent to api.deepl.com)"
+        raise TranslationError(
+            f"DeepL rejected the API key (403 Forbidden). The key was treated as a {plan} key. "
+            "Check that it is copied completely from your DeepL account's API Keys page, that "
+            "the key hasn't been deleted or regenerated, and that your DeepL API subscription "
+            "is active.")
     if response.status_code == 456:
         raise TranslationError("DeepL free-tier quota exceeded (456) for this billing period.")
     if not response.ok:

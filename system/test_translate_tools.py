@@ -91,6 +91,13 @@ class TranslateDeeplTests(unittest.TestCase):
         self.assertEqual(result, ["Bonjour"])
         self.assertEqual(session.calls[0][0], tools.DEEPL_FREE_ENDPOINT)
 
+    def test_key_goes_in_authorization_header_not_the_body(self):
+        session = FakeSession([FakeResponse(200, {"translations": [{"text": "Bonjour"}]})])
+        tools.translate_texts(["Hello"], "FR", "deepl", api_key=" abc:fx\n", session=session)
+        kwargs = session.calls[0][1]
+        self.assertEqual(kwargs["headers"]["Authorization"], "DeepL-Auth-Key abc:fx")
+        self.assertNotIn("auth_key", [name for name, _value in kwargs["data"]])
+
     def test_uses_pro_endpoint_for_non_fx_key(self):
         session = FakeSession([FakeResponse(200, {"translations": [{"text": "Bonjour"}]})])
         tools.translate_texts(["Hello"], "FR", "deepl", api_key="abcnotfree", session=session)
