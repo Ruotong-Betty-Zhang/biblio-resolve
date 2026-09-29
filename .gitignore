@@ -40,6 +40,8 @@ tmp/
 outputs/
 build/
 dist/
+.venv-build/
+*.spec
 
 # OS and editor files
 .DS_Store

@@ -51,8 +51,10 @@ _LangDetectorFactory.seed = 0
 
 try:  # Package import: python -m system.test_translate_tools
     from . import abstract_note_tools as abstract_tools
+    from .app_paths import data_file
 except ImportError:  # Direct app/script import from inside system/
     import abstract_note_tools as abstract_tools
+    from app_paths import data_file
 
 clean_value = abstract_tools.clean_value
 
@@ -93,7 +95,7 @@ MYMEMORY_MAX_REQUEST_BYTES = 480
 # never pays for a second API call.
 # ---------------------------------------------------------------------------
 
-TRANSLATE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "translate_cache.jsonl")
+TRANSLATE_CACHE_FILE = data_file("translate_cache.jsonl")
 _TRANSLATE_CACHE_LOCK = threading.Lock()
 TRANSLATE_CACHE_VERSION = "v1"
 

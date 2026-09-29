@@ -787,6 +787,13 @@ class SemanticModuleMatcher:
         return self.classify_batch([text])[0]
 
 
+def semantic_matching_available():
+    """Whether sentence-transformers is installed. The packaged exe leaves it
+    (and PyTorch, ~2 GB) out, so the page can explain that up front."""
+    import importlib.util
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
 def build_semantic_matcher():
     """Return a ready-to-use SemanticModuleMatcher, or None if
     sentence-transformers isn't installed or the model can't be loaded
@@ -940,7 +947,7 @@ def replace_data_country_tags(value, new_tags):
 # line, not the whole file.
 # ---------------------------------------------------------------------------
 
-FULL_TEXT_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "full_text_cache.jsonl")
+FULL_TEXT_CACHE_FILE = core.data_file("full_text_cache.jsonl")
 _FULL_TEXT_CACHE_LOCK = threading.Lock()
 FULL_TEXT_CACHE_VERSION = "v1"
 FULL_TEXT_SUCCESS_TTL = 180 * 86400   # successfully fetched text rarely changes

@@ -1,0 +1,14 @@
+# Packages bundled into the Windows exe (see build_exe.py). A subset of
+# requirements.txt: sentence-transformers (PyTorch, ~2 GB) and the OCR stack
+# (PyMuPDF + pytesseract, which also needs a separate Tesseract install) are
+# left out; the app detects that and skips those optional features.
+requests
+customtkinter
+pandas
+openpyxl
+rapidfuzz
+langdetect
+pypdf
+numpy
+matplotlib
+pyinstaller

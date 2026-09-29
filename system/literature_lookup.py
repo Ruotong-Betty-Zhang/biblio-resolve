@@ -1288,13 +1288,19 @@ class IsspModulePage(ctk.CTkFrame):
             settings, variable=self.network_doi_var,
             text="Also resolve GESIS dataset DOIs online (10.4232/1.xxxxx) — needed when a record "
                  "cites only a DOI, not a ZA study number").pack(anchor="w")
-        self.semantic_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
+        semantic_available = issp_tags.semantic_matching_available()
+        self.semantic_var = ctk.BooleanVar(value=semantic_available)
+        semantic_box = ctk.CTkCheckBox(
             settings, variable=self.semantic_var,
             text="Also match by meaning, even for records already tagged another way — free, "
                  "runs entirely on this computer (downloads a small open-source model the "
-                 "first time; no account, no per-use cost, nothing sent anywhere after that)").pack(
-                     anchor="w", pady=(4, 0))
+                 "first time; no account, no per-use cost, nothing sent anywhere after that)"
+            if semantic_available else
+            "Match by meaning — not included in this version of the app (it needs the "
+            "sentence-transformers package). All other matching steps still run.")
+        semantic_box.pack(anchor="w", pady=(4, 0))
+        if not semantic_available:
+            semantic_box.configure(state="disabled")
         self.full_text_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             settings, variable=self.full_text_var,

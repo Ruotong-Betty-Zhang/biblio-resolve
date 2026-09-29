@@ -37,14 +37,17 @@ import requests
 
 try:  # Package import: import system.lookup_core
     from . import doi_lookup_lib as lib
+    from .app_paths import data_file
 except ImportError:  # Direct app/script import from inside system/
     import doi_lookup_lib as lib
+    from app_paths import data_file
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-CACHE_FILE = os.path.join(_HERE, "lookup_cache.json")
-VERIFICATION_CACHE_FILE = os.path.join(_HERE, "verification_cache.json")
-ABSTRACT_CACHE_FILE = os.path.join(_HERE, "abstract_cache.jsonl")
-SETTINGS_FILE = os.path.join(_HERE, "app_settings.json")
+# Writable files live in app_paths.data_dir(): next to the code when run
+# from source, the user's data folder in a packaged exe.
+CACHE_FILE = data_file("lookup_cache.json")
+VERIFICATION_CACHE_FILE = data_file("verification_cache.json")
+ABSTRACT_CACHE_FILE = data_file("abstract_cache.jsonl")
+SETTINGS_FILE = data_file("app_settings.json")
 _VERIFICATION_CACHE_LOCK = __import__("threading").Lock()
 _ABSTRACT_CACHE_LOCK = __import__("threading").Lock()
 
