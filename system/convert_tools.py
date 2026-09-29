@@ -121,6 +121,9 @@ def portable_columns_for(columns, fmt):
             if column is not None:
                 native.add(column)
                 break
+    if fmt == "ris":
+        # "RIS DA", "RIS LA", ... are written back under their own tag.
+        native.update(c for c in columns if core.ris_extra_tag(c))
     return [c for c in columns if c not in native]
 
 

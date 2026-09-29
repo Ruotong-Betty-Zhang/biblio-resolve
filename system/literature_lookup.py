@@ -43,7 +43,9 @@ import threading
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import tkinter as tk
 from tkinter import Menu, filedialog, messagebox, simpledialog, ttk
+from tkinter import font as tkfont
 
 import customtkinter as ctk
 import pandas as pd
@@ -625,6 +627,37 @@ def _settings_subtabs(parent):
     return subtabs
 
 class App(ctk.CTk):
+    TAB_FONT_SIZES = (13, 12, 11, 10)
+
+    def _schedule_tab_fit(self, event):
+        if event.widget is not self:
+            return
+        if self._tab_fit_pending is not None:
+            self.after_cancel(self._tab_fit_pending)
+        self._tab_fit_pending = self.after(120, self._fit_tab_labels)
+
+    def _fit_tab_labels(self):
+        self._tab_fit_pending = None
+        """Use the largest tab-label font at which every main tab name fits.
+        The tab strip can't wrap or scroll, so at a narrow window (or 150%
+        display scaling) a fixed size clipped both ends of every label."""
+        segmented = self.tabview._segmented_button
+        available = self.tabview.winfo_width() - 50
+        if available <= 50:
+            return
+        scale = ctk.ScalingTracker.get_widget_scaling(segmented) or 1
+        family = ctk.CTkFont().cget("family")
+        chosen = self.TAB_FONT_SIZES[-1]
+        for size in self.TAB_FONT_SIZES:
+            measure = tkfont.Font(family=family, size=-round(size * scale), weight="bold").measure
+            needed = sum(measure(name) + 20 * scale for name in self.tabview._name_list)
+            if needed <= available:
+                chosen = size
+                break
+        if chosen != self._tab_font_size:
+            self._tab_font_size = chosen
+            segmented.configure(font=ctk.CTkFont(size=chosen, weight="bold"))
+
     def __init__(self):
         super().__init__()
         self.title("Literature Lookup")
@@ -647,6 +680,13 @@ class App(ctk.CTk):
         compare_tab = tabview.add("Compare Documents")
         translate_tab = tabview.add("Translate")
         tabview.set("Single Lookup")
+        self.tabview = tabview
+        self._tab_font_size = 13
+        # Toplevel bindings also see every child's events; react only to the window.
+        # Measure after the resize has been laid out; the tab strip still has
+        # its old width while the window's own <Configure> is delivered.
+        self._tab_fit_pending = None
+        self.bind("<Configure>", self._schedule_tab_fit, add="+")
 
         # Source selection lives under Batch Import and the verification
         # method under Verification, as sub-tabs. The settings objects are
@@ -835,7 +875,7 @@ class NoteLinkRecoveryPage(ctk.CTkFrame):
         if self.output_df is None:
             return
         _save_enriched_dataframe(self, self.output_df, self.file_path, "note_links",
-                                 format_label=self.output_format.get())
+                                 format_label=self.output_format.get(), patch_ris=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1095,7 +1135,12 @@ def _add_export_format_menu(parent, width=170):
     return menu
 
 
-def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_label=None):
+def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_label=None,
+                             patch_ris=False):
+    """Export a page's result. With ``patch_ris`` (pages that only edit
+    Notes / URL / DOI / keywords), a RIS source saved as RIS is written as a
+    patch of the original file: only the changed fields' lines are replaced
+    and every other line is kept exactly as it was."""
     base = os.path.splitext(os.path.basename(source_path or "records"))[0]
     source_label = core.preferred_output_format_label(source_path)
     chosen_label = format_label if format_label and format_label != SAME_AS_SOURCE_FORMAT else None
@@ -1117,12 +1162,21 @@ def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_labe
     ext = os.path.splitext(path)[1].casefold()
     formats = {".csv": "csv", ".xlsx": "excel", ".ris": "ris", ".bib": "bibtex",
                ".bibtex": "bibtex", ".json": "csl_json"}
+    fmt = formats.get(ext, default_format)
+    patched = False
     try:
-        core.write_records_file(dataframe, path, formats.get(ext, default_format))
+        if (patch_ris and fmt == "ris"
+                and os.path.splitext(source_path or "")[1].casefold() == ".ris"):
+            original = core.read_records_file(source_path).reset_index(drop=True)
+            patched = core.write_ris_patch(source_path, original, dataframe, path)
+        if not patched:
+            core.write_records_file(dataframe, path, fmt)
     except Exception as exc:
         messagebox.showerror("Export failed", f"Couldn't save the enriched file:\n{exc}")
         return
-    messagebox.showinfo("Export complete", f"Saved to:\n{path}")
+    extra = ("\nOnly the changed Note / URL / DOI / keyword lines were rewritten; every "
+             "other line of the source RIS was kept as it was." if patched else "")
+    messagebox.showinfo("Export complete", f"Saved to:\n{path}{extra}")
 
 
 def _export_table_rows(parent, rows, headers, default_name, format_label=None):
@@ -1561,7 +1615,7 @@ class TagCleanupPage(ctk.CTkFrame):
         if self.output_df is None:
             return
         _save_enriched_dataframe(self, self.output_df, self.file_path, "keywords_cleaned",
-                                 format_label=self.output_format.get())
+                                 format_label=self.output_format.get(), patch_ris=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2215,6 +2269,47 @@ class ManualReviewPage(ctk.CTkFrame):
                                      f"\n{path}{extra}")
 
 
+class _EditorText(tk.Text):
+    """A wrapping text editor drawn like a CTkEntry.
+
+    Plain Tk on purpose: a CTkTextbox redraws its (even hidden) scrollbars
+    with update_idletasks() whenever its parent frame is re-coloured, so
+    re-colouring the review rows (toggling the comparison) took seconds.
+    Text past the visible lines scrolls with the mouse wheel."""
+
+    def __init__(self, master):
+        # Same colours as the theme's CTkEntry, so both kinds of field match.
+        mode = 1 if ctk.get_appearance_mode() == "Dark" else 0
+        entry_theme = ctk.ThemeManager.theme["CTkEntry"]
+        pick = lambda value: value[mode] if isinstance(value, (tuple, list)) else value
+        self._colors = {
+            "bg": pick(entry_theme["fg_color"]),
+            "fg": pick(entry_theme["text_color"]),
+            "border": pick(entry_theme["border_color"]),
+            "focus": "#1F6AA5" if mode else "#0F6CBD",
+        }
+        scale = ctk.ScalingTracker.get_widget_scaling(master) or 1
+        family = ctk.CTkFont().cget("family")
+        super().__init__(
+            master, height=1, wrap="word", relief="flat", borderwidth=0,
+            font=tkfont.Font(family=family, size=-round(13 * scale)),
+            padx=round(7 * scale), pady=round(5 * scale),
+            background=self._colors["bg"], foreground=self._colors["fg"],
+            insertbackground=self._colors["fg"], highlightthickness=max(1, round(scale)),
+            highlightbackground=self._colors["border"], highlightcolor=self._colors["focus"])
+
+    def configure(self, cnf=None, **kwargs):
+        # Accept CustomTkinter's text_color=(light, dark) like the entries do.
+        text_color = kwargs.pop("text_color", None)
+        if text_color is not None:
+            if isinstance(text_color, (tuple, list)):
+                text_color = text_color[1] if ctk.get_appearance_mode() == "Dark" else text_color[0]
+            kwargs["foreground"] = text_color
+        return super().configure(cnf, **kwargs)
+
+    config = configure
+
+
 class ManualReviewDialog(ctk.CTkToplevel):
     """Focused record-by-record comparison over the Manual Review queue."""
 
@@ -2452,12 +2547,12 @@ class ManualReviewDialog(ctk.CTkToplevel):
         return len(value) > 45 or "\n" in value
 
     EDITOR_LINE_HEIGHT = 20
-    EDITOR_MAX_LINES = 10  # longer values (abstracts) scroll inside the box
+    EDITOR_MAX_LINES = 10  # longer values (abstracts) scroll inside the box with the mouse wheel
 
     def _fit_editor_height(self, widget, value=None):
         """Size a textbox editor to its wrapped content, estimated from the
         text length and the widget's current width (no layout pass needed)."""
-        if not isinstance(widget, ctk.CTkTextbox):
+        if not isinstance(widget, _EditorText):
             return
         if value is None:
             value = widget.get("1.0", "end-1c")
@@ -2465,7 +2560,7 @@ class ManualReviewDialog(ctk.CTkToplevel):
         if widget.winfo_width() > 1:
             # Laid out: let the text widget count its own wrapped lines.
             try:
-                counted = widget._textbox.count("1.0", "end", "update", "displaylines")
+                counted = widget.count("1.0", "end", "update", "displaylines")
                 lines = counted[0] if isinstance(counted, (tuple, list)) else counted
             except Exception:
                 lines = None
@@ -2475,25 +2570,35 @@ class ManualReviewDialog(ctk.CTkToplevel):
             width = max(300, parent_width - 130) if parent_width > 1 else 420
             chars_per_line = max(20, int((width - 20) / 9))
             lines = sum(max(1, math.ceil(len(part) / chars_per_line)) for part in value.split("\n"))
-        height = min(self.EDITOR_MAX_LINES, max(1, lines)) * self.EDITOR_LINE_HEIGHT + 14
-        if widget.cget("height") != height:
+        height = min(self.EDITOR_MAX_LINES, max(1, lines))  # tk.Text height is in lines
+        if int(widget.cget("height")) != height:
             widget.configure(height=height)
 
     def _refit_on_resize(self, widget):
         """Re-estimate a textbox's height when its width changes."""
-        state = {"width": 0}
+        state = {"width": 0, "pending": None}
+
+        def refit():
+            state["pending"] = None
+            if widget.winfo_exists():
+                self._fit_editor_height(widget)
 
         def on_configure(event):
+            # Deferred and coalesced: refitting inside the event resized the
+            # box, which fired more <Configure>s - toggling the comparison
+            # (half -> full width) cascaded into seconds of re-measuring.
             if abs(event.width - state["width"]) > 20:
                 state["width"] = event.width
-                self._fit_editor_height(widget)
+                if state["pending"] is not None:
+                    widget.after_cancel(state["pending"])
+                state["pending"] = widget.after(80, refit)
         widget.bind("<Configure>", on_configure, add="+")
 
     def _set_editor_value(self, widget, value):
         """Replace an editor's text and apply the current edit/view state."""
         editable = bool(self.edit_mode_var.get())
         widget.configure(state="normal")
-        if isinstance(widget, ctk.CTkTextbox):
+        if isinstance(widget, _EditorText):
             widget.delete("1.0", "end")
             widget.insert("1.0", value)
             self._fit_editor_height(widget, value)
@@ -2510,7 +2615,7 @@ class ManualReviewDialog(ctk.CTkToplevel):
         Returns (widget, getter). Outside edit mode the widget is read-only
         (text can still be selected and copied)."""
         if self._needs_textbox(value):
-            widget = ctk.CTkTextbox(parent, height=34, wrap="word", font=ctk.CTkFont(size=13))
+            widget = _EditorText(parent)
             self._refit_on_resize(widget)
             getter = lambda w=widget: w.get("1.0", "end-1c").strip()
         else:
@@ -2537,7 +2642,9 @@ class ManualReviewDialog(ctk.CTkToplevel):
 
         # Input side. Swap entry/textbox only when the value's length needs it.
         holder = widgets["holder"]
-        holder.configure(fg_color=color if show_compare else "transparent")
+        # Without the comparison every field keeps the neutral grey card, so
+        # both views look alike (category is "missing" when not comparing).
+        holder.configure(fg_color=color)
         if widgets["is_textbox"] != self._needs_textbox(input_value):
             widgets["editor"].destroy()
             widgets["editor"], _getter = self._make_editor(holder, input_value)

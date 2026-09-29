@@ -2012,6 +2012,103 @@ def preferred_output_format_label(path):
     }.get(extension, "CSV table (.csv)")
 
 
+# Columns a cleanup page may change, and how each maps back onto RIS lines:
+# (tags the reader folds into the column, tag to write, how to write it).
+_RIS_PATCH_FIELDS = {
+    "Notes": (("N1", "RN"), "N1", "lines"),
+    "Url": (("UR",), "UR", "single"),
+    "DOI": (("DO",), "DO", "single"),
+    "Keywords": (("KW",), "KW", "tags"),
+    "Abstract": (("AB", "N2"), "AB", "lines"),
+    "Title": (("TI", "T1"), "TI", "single"),
+}
+_RIS_LINE_RE = re.compile(r"^\s*([A-Za-z0-9]{2})\s*-\s*(.*?)\s*$")
+
+
+def _ris_blocks(path):
+    """The raw lines of each record, grouped exactly as _read_ris groups them."""
+    blocks, current = [], None
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for raw in f:
+            line = raw.rstrip("\r\n")
+            match = _RIS_LINE_RE.match(line)
+            tag = match.group(1).upper() if match else None
+            if tag == "TY":
+                current = [line]  # like the reader, an unclosed record is dropped
+            elif current is not None:
+                current.append(line)
+                if tag == "ER":
+                    blocks.append(current)
+                    current = None
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _patch_value(value):
+    if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+def write_ris_patch(source_path, original_df, new_df, path):
+    """Write ``new_df`` as a copy of the RIS file it was read from, replacing
+    only the lines of fields whose values changed (Notes, URL, DOI, keywords,
+    abstract, title). Every other line - VL, IS, SN, T2, DA, AU, ... - is kept
+    byte for byte, so a Note cleanup can't lose or reformat anything else.
+
+    ``original_df`` is the file as read, row-aligned with ``new_df``. Columns
+    that only exist in ``new_df`` (audit columns) are ignored. Returns False,
+    writing nothing, when the change can't be expressed as such a patch (row
+    count differs, or another existing column changed); the caller then falls
+    back to write_records_file."""
+    blocks = _ris_blocks(source_path)
+    if not (len(blocks) == len(original_df) == len(new_df)):
+        return False
+    original_df = original_df.reset_index(drop=True)
+    new_df = new_df.reset_index(drop=True)
+    for column in original_df.columns:
+        if column in _RIS_PATCH_FIELDS or column not in new_df.columns:
+            continue
+        if not original_df[column].map(_patch_value).equals(new_df[column].map(_patch_value)):
+            return False
+    output = []
+    for index, block in enumerate(blocks):
+        block = list(block)
+        for column, (read_tags, write_tag, style) in _RIS_PATCH_FIELDS.items():
+            if column not in new_df.columns:
+                continue
+            old = _patch_value(original_df.at[index, column]) if column in original_df.columns else ""
+            new = _patch_value(new_df.at[index, column])
+            if old == new:
+                continue
+            kept, position, dropping = [], None, False
+            for line in block:
+                match = _RIS_LINE_RE.match(line)
+                if match:
+                    dropping = match.group(1).upper() in read_tags
+                    if dropping and position is None:
+                        position = len(kept)
+                if not dropping:
+                    kept.append(line)
+            if style == "lines":
+                values = [part.strip() for part in new.splitlines() if part.strip()]
+            elif style == "tags":
+                values = split_tags(new)[0]
+            else:
+                values = [new] if new else []
+            if position is None:  # field is new to this record: add before ER
+                position = next((i for i in range(len(kept) - 1, -1, -1)
+                                 if (_RIS_LINE_RE.match(kept[i]) or [None, ""])[1].upper() == "ER"),
+                                len(kept))
+            block = kept[:position] + [f"{write_tag}  - {value}" for value in values] + kept[position:]
+        output.append(block)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        for block in output:
+            f.write("\n".join(block).rstrip("\n") + "\n\n")
+    return True
+
+
 def write_records_file(df: pd.DataFrame, path: str, fmt: str, portable_columns=None):
     if fmt == "csv":
         export_df = df.copy()
@@ -2051,8 +2148,38 @@ def _value(row, *names):
     return ""
 
 
+_PERSON_NAME_RE = re.compile(r"^(?:[A-ZÀ-ɏ][\w.'À-ɏ-]*\s*){2,4}$")
+_ORGANISATION_WORDS = {"for", "of", "the", "on", "in", "at", "to", "und", "für", "du"}
+
+
+def _looks_like_person(part):
+    """"Last, First" or 2-4 capitalised words, and no connective such as
+    "for"/"of" that marks an organisation ("Directorate for Education, ...")."""
+    name = part.strip(" ,;")
+    words = name.replace(",", " ").split()
+    if not words or any(word in _ORGANISATION_WORDS for word in words):
+        return False
+    if "," in name:
+        return name.count(",") == 1 and len(words) <= 6
+    return bool(_PERSON_NAME_RE.match(name))
+
+
 def _split_authors(value):
-    return [a.strip() for a in re.split(r"\s*(?:;|\band\b)\s*", str(value or "")) if a.strip()]
+    """Split an author list. Semicolons always separate authors; " and " (the
+    BibTeX separator, also typed inside single RIS AU lines) splits only when
+    every piece looks like a person's name, so organisations such as "Center
+    for Social Research and Data Archives" stay one author."""
+    authors = []
+    for piece in str(value or "").split(";"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        parts = [p.strip() for p in re.split(r"\s+and\s+", piece) if p.strip()]
+        if len(parts) > 1 and all(_looks_like_person(p) for p in parts):
+            authors.extend(p.strip(" ,") for p in parts)
+        else:
+            authors.append(piece)
+    return authors
 
 
 def _verification_note(row):
@@ -2174,6 +2301,22 @@ def _to_csl_item(row, index):
     return item
 
 
+# RIS tags without a dedicated column (DA, LA, CY, A2, ET, C1, M3, ...) are
+# kept verbatim in "RIS <tag>" columns and written back by _write_ris, so a
+# RIS -> app -> RIS round trip no longer drops them. Repeated tags are kept
+# one value per line.
+RIS_EXTRA_COLUMN_PREFIX = "RIS "
+_RIS_EXTRA_COLUMN_RE = re.compile(r"^RIS ([A-Z0-9]{2})$")
+_RIS_MAPPED_TAGS = {"TY", "ER", "TI", "T1", "AU", "A1", "PY", "Y1", "JO", "JF", "T2", "DO",
+                    "UR", "L1", "SN", "VL", "IS", "SP", "EP", "PB", "KW", "N1", "RN", "AB", "N2"}
+
+
+def ris_extra_tag(column):
+    """The RIS tag a "RIS <tag>" pass-through column holds, else None."""
+    match = _RIS_EXTRA_COLUMN_RE.match(str(column))
+    return match.group(1) if match else None
+
+
 def _read_ris(path):
     records, current = [], {}
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
@@ -2214,6 +2357,10 @@ def _read_ris(path):
                 filter(None, [current.get("Notes"), value]))
             elif tag in {"AB", "N2"}: current["Abstract"] = "\n".join(
                 filter(None, [current.get("Abstract"), value]))
+            if tag not in _RIS_MAPPED_TAGS and value:
+                # DA also feeds Publication Year above; the full date is kept too.
+                column = RIS_EXTRA_COLUMN_PREFIX + tag
+                current[column] = "\n".join(filter(None, [current.get(column), value]))
     if current: records.append(_restore_portable_columns(current))
     return records
 
@@ -2255,6 +2402,11 @@ def _write_ris(df, path, portable_columns=None):
                                              _portable_columns_note(row, portable_columns)]))
             for note_line in note.splitlines():
                 if note_line.strip(): f.write(f"N1  - {note_line.strip()}\n")
+            for column in row.index:
+                extra_tag = ris_extra_tag(column)
+                if extra_tag and extra_tag not in _RIS_MAPPED_TAGS:
+                    for extra_line in _value(row, column).splitlines():
+                        if extra_line.strip(): f.write(f"{extra_tag}  - {extra_line.strip()}\n")
             f.write("ER  - \n\n")
 
 

@@ -98,6 +98,91 @@ class BibtexEscapingRoundTripTests(unittest.TestCase):
         self.assertEqual(loaded.loc[0, "Title"], 'M{\\"u}ller and Co \\& Partners')
 
 
+class RisPassThroughTests(unittest.TestCase):
+    RIS = ("TY  - JOUR\nTI  - Work orientations\nAU  - Center for Social Research and Data Archives\n"
+           "AU  - Kelley, Jonathan\nT2  - Acta Sociologica\nVL  - 44\nIS  - 2\nSP  - 97\nEP  - 110\n"
+           "SN  - 0001-6993\nPB  - SAGE\nDA  - 2001/06/01\nLA  - en\nCY  - London\n"
+           "A2  - Editor, One\nA2  - Editor, Two\nER  - \n")
+
+    def test_every_tag_survives_a_ris_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = os.path.join(folder, "in.ris"), os.path.join(folder, "out.ris")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(self.RIS)
+            frame = core.read_records_file(source, as_text=True)
+            self.assertEqual(frame.loc[0, "RIS A2"], "Editor, One\nEditor, Two")
+            self.assertEqual(tools.portable_columns_for(list(frame.columns), "ris"), [])
+            tools.convert_file(frame, target, "ris", list(frame.columns))
+            with open(target, encoding="utf-8") as stream:
+                written = stream.read()
+        for line in ("VL  - 44", "IS  - 2", "SP  - 97", "EP  - 110", "SN  - 0001-6993", "PB  - SAGE",
+                     "DA  - 2001/06/01", "LA  - en", "CY  - London", "A2  - Editor, One",
+                     "A2  - Editor, Two", "JO  - Acta Sociologica",
+                     "AU  - Center for Social Research and Data Archives", "AU  - Kelley, Jonathan"):
+            self.assertIn(line, written)
+        self.assertEqual(written.count("AU  - "), 2)
+
+
+class RisPatchTests(unittest.TestCase):
+    RIS = ("TY  - JOUR\nTI  - Work orientations\nAU  - Kelley, Jonathan\nT2  - Acta Sociologica\n"
+           "VL  - 44\nSP  - 97\nEP  - 110\nDA  - 2001/06/01\nN1  - <p>see https://x.org/a</p>\n"
+           "N1  - (ISSP)\nKW  - FAMGEN\nKW  - wrong\nER  - \n\n"
+           "TY  - BOOK\nTI  - Second\nCY  - London\nER  - \n\n")
+
+    def _run(self, change):
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = os.path.join(folder, "in.ris"), os.path.join(folder, "out.ris")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(self.RIS)
+            original = core.read_records_file(source)
+            changed = original.copy()
+            change(changed)
+            ok = core.write_ris_patch(source, original, changed, target)
+            if not ok:
+                self.assertFalse(os.path.exists(target))  # a refused patch writes nothing
+                return ok, ""
+            with open(target, encoding="utf-8") as stream:
+                return ok, stream.read()
+
+    def test_only_changed_fields_are_rewritten(self):
+        def change(frame):
+            frame.at[0, "Notes"] = "(ISSP)"
+            frame.at[1, "Url"] = "https://x.org/b"
+            frame["Link Added From Note"] = [False, True]  # audit column: ignored
+        ok, text = self._run(change)
+        self.assertTrue(ok)
+        for line in ("T2  - Acta Sociologica", "VL  - 44", "SP  - 97", "EP  - 110",
+                     "DA  - 2001/06/01", "KW  - FAMGEN", "KW  - wrong", "CY  - London"):
+            self.assertIn(line, text)
+        self.assertNotIn("https://x.org/a", text)
+        self.assertEqual(text.count("N1  - "), 1)
+        second = text.split("TY  - BOOK")[1]
+        self.assertLess(second.index("UR  - https://x.org/b"), second.index("ER  -"))
+
+    def test_keywords_patch(self):
+        ok, text = self._run(lambda frame: frame.__setitem__("Keywords", ["FAMGEN", ""]))
+        self.assertTrue(ok)
+        self.assertIn("KW  - FAMGEN", text)
+        self.assertNotIn("KW  - wrong", text)
+
+    def test_other_column_change_refuses_patch(self):
+        ok, _text = self._run(lambda frame: frame.__setitem__("Volume", ["45", ""]))
+        self.assertFalse(ok)
+
+
+class SplitAuthorsTests(unittest.TestCase):
+    def test_organisation_with_and_is_one_author(self):
+        self.assertEqual(core._split_authors("Department of Economic and Social Affairs"),
+                         ["Department of Economic and Social Affairs"])
+
+    def test_bibtex_style_people_are_split(self):
+        self.assertEqual(core._split_authors("Bonsang, E. and A. Van Soest"), ["Bonsang, E.", "A. Van Soest"])
+
+    def test_semicolons_win(self):
+        self.assertEqual(core._split_authors("Smith, J.; Doe and Partners Ltd"),
+                         ["Smith, J.", "Doe and Partners Ltd"])
+
+
 class CaseCollisionRoundTripTests(unittest.TestCase):
     def test_record_doi_written_to_tag_and_lookup_doi_kept_in_note(self):
         frame = pd.DataFrame({"Title": ["Paper"], "DOI": ["10.1/own"], "doi": ["10.1/lookup"]})
