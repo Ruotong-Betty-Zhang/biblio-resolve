@@ -14,7 +14,10 @@ system/app_settings.json
 doi_lookup_cache*.json
 system/lookup_cache.json
 system/verification_cache.json
+system/verification_cache.json.tmp
 system/abstract_cache.jsonl
+system/translate_cache.jsonl
+system/full_text_cache.jsonl
 
 # Research datasets and generated tabular outputs
 *.csv
