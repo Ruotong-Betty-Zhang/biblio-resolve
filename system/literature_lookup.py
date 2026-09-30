@@ -1143,7 +1143,7 @@ def _add_export_format_menu(parent, width=170):
 
 
 def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_label=None,
-                             patch_ris=False):
+                             patch_ris=False, note_columns=()):
     """Export a page's result. With ``patch_ris`` (pages that only edit
     Notes / URL / DOI / keywords), a RIS source saved as RIS is written as a
     patch of the original file: only the changed fields' lines are replaced
@@ -1175,9 +1175,11 @@ def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_labe
         if (patch_ris and fmt == "ris"
                 and os.path.splitext(source_path or "")[1].casefold() == ".ris"):
             original = core.read_records_file(source_path).reset_index(drop=True)
-            patched = core.write_ris_patch(source_path, original, dataframe, path)
+            patched = core.write_ris_patch(source_path, original, dataframe, path,
+                                           note_columns=note_columns)
         if not patched:
-            core.write_records_file(dataframe, path, fmt)
+            keep = [c for c in note_columns if c in dataframe.columns]
+            core.write_records_file(dataframe, path, fmt, portable_columns=keep or None)
     except Exception as exc:
         messagebox.showerror("Export failed", f"Couldn't save the enriched file:\n{exc}")
         return
@@ -1309,6 +1311,13 @@ class IsspModulePage(ctk.CTkFrame):
                  "Data sections an abstract alone would miss, and also looks for which "
                  "country(ies)' data the record used, tagged \"DATA - <country>\". Uses OCR for "
                  "scanned PDFs when Tesseract is installed.").pack(anchor="w", pady=(4, 0))
+        self.low_to_keywords_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            settings, variable=self.low_to_keywords_var,
+            text="Also add low-confidence tags (meaning-only matches) to the keywords — off by "
+                 "default: in the keywords a tag's confidence is no longer visible. Every match, "
+                 "with its confidence and evidence, is always listed in the results and CSV/Excel "
+                 "exports. Existing keyword tags are never removed.").pack(anchor="w", pady=(4, 0))
 
         run_row = ctk.CTkFrame(self, fg_color="transparent")
         run_row.pack(fill="x", padx=4, pady=(0, 6))
@@ -1397,6 +1406,7 @@ class IsspModulePage(ctk.CTkFrame):
             if fetch_full_text else "Classifying…")
         use_network_doi_lookup = self.network_doi_var.get()
         use_semantic_matching = self.semantic_var.get()
+        keyword_min_confidence = "low" if self.low_to_keywords_var.get() else "medium"
 
         def worker():
             try:
@@ -1406,6 +1416,7 @@ class IsspModulePage(ctk.CTkFrame):
                     use_network_doi_lookup=use_network_doi_lookup,
                     use_semantic_matching=use_semantic_matching,
                     fetch_full_text=fetch_full_text,
+                    keyword_min_confidence=keyword_min_confidence,
                     cancel_event=self.cancel_event,
                     progress_callback=lambda done, total, index, confidence:
                         self.events.put(("progress", (done, total, confidence))))
@@ -1469,8 +1480,12 @@ class IsspModulePage(ctk.CTkFrame):
 
     def on_export(self):
         if self.output_df is not None:
+            # A RIS saved as RIS only has its keyword (KW) lines rewritten.
+            # The per-confidence tag columns travel in the record Note, so they come
+            # back as columns in Review & Convert (to add chosen ones to the keywords).
             _save_enriched_dataframe(self, self.output_df, self.file_path, "issp_module_tags",
-                                     format_label=self.output_format.get())
+                                     format_label=self.output_format.get(), patch_ris=True,
+                                     note_columns=tuple(issp_tags.CONFIDENCE_TAG_COLUMNS.values()))
 
 
 # ---------------------------------------------------------------------------
@@ -1645,6 +1660,7 @@ class ManualReviewPage(ctk.CTkFrame):
                       if value[0] in {"csv", "excel", "ris", "bibtex"}}
     ALL_ROWS, FILTERED_ROWS = "All", "Filtered"
     ALL_COLUMNS, TICKED_COLUMNS = "All", "Ticked only"
+    SELECTED_SCOPE, FILTERED_SCOPE, ALL_SCOPE = "Selected record", "Filtered records", "All records"
     REVIEW_COLUMNS = ("Manual Decision", "Manual Notes")
     DEFAULT_ALIASES = [
         ("Title", core.TITLE_ALIASES), ("Year", core.YEAR_ALIASES),
@@ -1768,6 +1784,27 @@ class ManualReviewPage(ctk.CTkFrame):
             self.filter_summary_box,
             "Choose a condition and click Apply. Use 'Add another' to combine several conditions with AND or OR.")
         filters.grid_columnconfigure(7, weight=1)
+
+        # Copy one column's values into another, e.g. accept the module tags
+        # of "ISSP Tags (low)" into Keywords for the records you checked.
+        add_row = ctk.CTkFrame(main)
+        add_row.pack(fill="x", pady=(0, 7))
+        ctk.CTkLabel(add_row, text="Add values of", font=ctk.CTkFont(weight="bold")).pack(
+            side="left", padx=(10, 6), pady=7)
+        self.add_source = _make_searchable_combobox(add_row, values=[NO_COLUMN], width=190)
+        self.add_source.pack(side="left", pady=7)
+        ctk.CTkLabel(add_row, text="to").pack(side="left", padx=6)
+        self.add_target = _make_searchable_combobox(add_row, values=[NO_COLUMN], width=190)
+        self.add_target.pack(side="left", pady=7)
+        ctk.CTkLabel(add_row, text="for").pack(side="left", padx=6)
+        self.add_scope = ctk.CTkSegmentedButton(
+            add_row, values=[self.SELECTED_SCOPE, self.FILTERED_SCOPE, self.ALL_SCOPE])
+        self.add_scope.set(self.SELECTED_SCOPE)
+        self.add_scope.pack(side="left")
+        ctk.CTkButton(add_row, text="Add", width=70, command=self.on_add_column_values).pack(
+            side="left", padx=8)
+        ctk.CTkLabel(add_row, text="Items already in the target are skipped; nothing is removed.",
+                     text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
         nav = ctk.CTkFrame(main, fg_color="transparent")
         nav.pack(fill="x", pady=(0, 5))
         self.first_btn = ctk.CTkButton(nav, text="«", width=36, command=lambda: self.go_to_page(0), state="disabled")
@@ -1869,6 +1906,7 @@ class ManualReviewPage(ctk.CTkFrame):
             self.output_format.set(source_label)
         self._build_column_choices()
         _update_combobox_values(self.filter_column, list(df.columns))
+        self._refresh_add_columns(initial=True)
         self.filter_column.set(str(df.columns[0]))
         self._on_filter_column_change(str(df.columns[0]))
         _set_readonly_text(
@@ -2151,6 +2189,60 @@ class ManualReviewPage(ctk.CTkFrame):
             self.custom_editor.grid_columnconfigure(col, weight=1)
             self.custom_entries[column] = entry
 
+    def _refresh_add_columns(self, initial=False):
+        columns = list(self.df.columns)
+        _update_combobox_values(self.add_source, columns)
+        _update_combobox_values(self.add_target, columns)
+        if initial or self.add_source.get() not in columns:
+            low = issp_tags.CONFIDENCE_TAG_COLUMNS["low"]
+            self.add_source.set(low if low in columns else NO_COLUMN)
+        if initial or self.add_target.get() not in columns:
+            self.add_target.set(core.guess_column(columns, core.TAG_ALIASES) or NO_COLUMN)
+
+    def on_add_column_values(self):
+        """Add one column's items to another for the selected, filtered or all records."""
+        if self.df is None:
+            return
+        source, target = self.add_source.get().strip(), self.add_target.get().strip()
+        if source not in self.df.columns:
+            messagebox.showwarning("Choose a column", "Pick the column whose values should be added.")
+            return
+        if not target or target == NO_COLUMN or target == source:
+            messagebox.showwarning("Choose a target column",
+                                   "Pick (or type the name of) a different column to add the values to.")
+            return
+        self._store_selected()
+        scope = self.add_scope.get()
+        if scope == self.SELECTED_SCOPE:
+            if self.selected_df_index is None:
+                messagebox.showinfo("Select a record", "Click a record in the table first.")
+                return
+            indices = [self.selected_df_index]
+        elif scope == self.FILTERED_SCOPE:
+            indices = self.filtered_indices if self.filter_conditions else list(self.df.index)
+        else:
+            indices = list(self.df.index)
+        with_values = [i for i in indices if convert_tools.split_values(self.df.at[i, source])]
+        if not with_values:
+            messagebox.showinfo("Nothing to add", f"“{source}” is empty for the chosen records.")
+            return
+        if len(indices) > 1 and not messagebox.askyesno(
+                "Add values",
+                f"Add the values of “{source}” to “{target}” for {len(with_values):,} record(s)?\n"
+                "Values already in the target are skipped; nothing is removed."):
+            return
+        is_new = target not in self.df.columns
+        changed = convert_tools.add_column_values(self.df, indices, source, target)
+        if is_new:
+            self.register_columns_changed(select=target)
+        saved_index = self.selected_df_index
+        self.render_page()
+        if saved_index is not None and saved_index in self.page_indices:
+            self.select_row(self.page_indices.index(saved_index))
+            self.table.tree.selection_set(str(self.page_indices.index(saved_index)))
+        self.page_label.configure(
+            text=self.page_label.cget("text") + f" | Added “{source}” to “{target}” in {changed:,} record(s)")
+
     def add_manual_field(self):
         if self.df is None:
             messagebox.showinfo("Choose a file", "Load a file before adding a manual field.")
@@ -2174,6 +2266,7 @@ class ManualReviewPage(ctk.CTkFrame):
             chosen.add(select)
         self._build_column_choices(selected=chosen)
         _update_combobox_values(self.filter_column, list(self.df.columns))
+        self._refresh_add_columns()
 
     def change_page(self, delta):
         self.go_to_page(self.page + delta)
@@ -4486,26 +4579,48 @@ class StatisticsPage(ctk.CTkFrame):
                                           command=self.on_generate, state="disabled")
         self.generate_btn.grid(row=1, column=3, sticky="w", padx=10, pady=(0, 10))
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=4, pady=(0, 6))
-        body.grid_columnconfigure(0, weight=1)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
+        # Resizable areas: drag the grey bars to trade space between the column
+        # overview / chart (top) and the counts table (bottom), and between
+        # the overview and the chart.
+        ctk.CTkLabel(self, text="Drag the grey bars to resize the tables and the chart.",
+                     text_color=("gray40", "gray60"), font=ctk.CTkFont(size=11), anchor="w").pack(
+                         fill="x", padx=6, pady=(0, 2))
+        sash = "#4A4A4A" if ctk.get_appearance_mode() == "Dark" else "#D2D7DE"
+        panes = dict(sashwidth=8, sashrelief="flat", bd=0, bg=sash, opaqueresize=True)
+        self.vertical_panes = tk.PanedWindow(self, orient="vertical", sashcursor="sb_v_double_arrow",
+                                             **panes)
+        self.vertical_panes.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+        self.horizontal_panes = tk.PanedWindow(self.vertical_panes, orient="horizontal",
+                                               sashcursor="sb_h_double_arrow", **panes)
 
         self.overview_table = ResultsTable(
-            body, headers=["Column", "Kind", "Non-empty", "Unique values"], weights=[2, 0, 0, 0])
-        self.overview_table.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-
-        chart_frame = ctk.CTkFrame(body)
-        chart_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+            self.horizontal_panes, headers=["Column", "Kind", "Non-empty", "Unique values"],
+            weights=[2, 0, 0, 0])
+        chart_frame = ctk.CTkFrame(self.horizontal_panes)
         self.figure = Figure(figsize=(5, 4), dpi=100)
         self.axes = self.figure.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.figure, master=chart_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
         self._clear_chart("Pick a column above and click Generate.")
+        self.horizontal_panes.add(self.overview_table, minsize=200, stretch="always")
+        self.horizontal_panes.add(chart_frame, minsize=200, stretch="always")
 
-        self.counts_table = ResultsTable(self, headers=["Value", "Count", "Percentage"], weights=[2, 0, 0])
-        self.counts_table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+        self.counts_table = ResultsTable(self.vertical_panes, headers=["Value", "Count", "Percentage"],
+                                         weights=[2, 0, 0])
+        self.vertical_panes.add(self.horizontal_panes, minsize=120, stretch="always")
+        self.vertical_panes.add(self.counts_table, minsize=90, stretch="always")
+        self._panes_placed = False
+        self.vertical_panes.bind("<Configure>", self._place_sashes, add="+")
+
+    def _place_sashes(self, _event=None):
+        """Start with an even split once the panes have a real size."""
+        if self._panes_placed:
+            return
+        height, width = self.vertical_panes.winfo_height(), self.horizontal_panes.winfo_width()
+        if height > 50 and width > 50:
+            self._panes_placed = True
+            self.vertical_panes.sash_place(0, 0, int(height * 0.55))
+            self.horizontal_panes.sash_place(0, int(width * 0.5), 0)
 
     def on_choose_file(self):
         path = filedialog.askopenfilename(
