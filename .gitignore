@@ -42,6 +42,7 @@ build/
 dist/
 .venv-build/
 *.spec
+system/manual/demo/
 
 # OS and editor files
 .DS_Store
