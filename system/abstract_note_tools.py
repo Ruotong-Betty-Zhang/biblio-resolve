@@ -134,6 +134,9 @@ def remove_links_from_note(note, links):
     if not removed:
         return clean_value(note), 0
     text = re.sub(r"\(\s*\)|\[\s*\]", "", text)
+    # Punctuation that followed a removed link at the start of a line or
+    # paragraph ("<p>https://… . (ISSP)</p>" -> "<p>(ISSP)</p>").
+    text = re.sub(r"(^|\n|<p\b[^>]*>)[ \t]*[.,;:]+[ \t]*", r"\1", text, flags=re.IGNORECASE)
     previous = None
     while previous != text:
         previous = text
@@ -176,7 +179,7 @@ def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, do
 
     before_links, notes, link_and_note = 0, 0, 0
     no_link_with_note, no_link_note_url, added = 0, 0, 0
-    links_removed, notes_changed_by_link, issp_cleared = 0, 0, 0
+    links_removed, notes_changed_by_link, issp_cleared, issp_lines_cleared = 0, 0, 0, 0
     for index, row in frame.iterrows():
         note = clean_value(row.get(note_column, "")) if note_column else ""
         link_before = record_link(row, url_column, doi_column)
@@ -200,9 +203,23 @@ def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, do
             new_note = note
             if remove_imported_links:
                 final_link = record_link(frame.loc[index], url_column, doi_column)
-                new_note, count = remove_links_from_note(
-                    note, [final_link, clean_value(frame.at[index, url_column]),
-                           clean_value(row.get(doi_column, "")) if doi_column else ""])
+                links = [final_link, clean_value(frame.at[index, url_column]),
+                         clean_value(row.get(doi_column, "")) if doi_column else ""]
+                # Line by line: in a Note of several lines, a line that held only a
+                # link and "ISSP" ("<p>https://… . (ISSP)</p>") goes with the link
+                # when ISSP-only Notes are cleared; the other lines stay.
+                note_lines = note.split("\n")
+                kept_lines, count = [], 0
+                for line in note_lines:
+                    new_line, removed = remove_links_from_note(line, links)
+                    count += removed
+                    if (removed and remove_issp_only_notes and len(note_lines) > 1
+                            and is_issp_only_note(new_line)):
+                        issp_lines_cleared += 1
+                        continue
+                    if new_line or not removed:
+                        kept_lines.append(new_line)
+                new_note = "\n".join(kept_lines).strip() if count else note
                 links_removed += count
                 notes_changed_by_link += bool(count)
             if remove_issp_only_notes and is_issp_only_note(new_note):
@@ -229,6 +246,7 @@ def analyze_notes_and_add_links(dataframe, note_column=None, url_column=None, do
         "Links removed from Notes": links_removed,
         "Notes changed by link removal": notes_changed_by_link,
         "ISSP-only Notes cleared": issp_cleared,
+        "ISSP-only Note lines cleared after link removal": issp_lines_cleared,
     }
     return frame, stats, {"note_column": note_column, "url_column": url_column, "doi_column": doi_column}
 

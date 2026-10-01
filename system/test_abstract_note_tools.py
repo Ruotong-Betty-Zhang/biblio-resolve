@@ -554,6 +554,22 @@ class AbstractNoteToolsTests(unittest.TestCase):
         self.assertEqual(out.at[1, "Notes"], "")
         self.assertEqual(stats["ISSP-only Notes cleared"], 1)
 
+    def test_link_and_issp_line_goes_but_other_note_lines_stay(self):
+        notes = ("<p>Cited by: 31</p>\n<p>https://doi.org/10.1/a. (ISSP)</p>\n"
+                 "<p>https://other.org/x. (ISSP)</p>\n<p>(ISSP)</p>")
+        frame = pd.DataFrame({"Title": ["A"], "Url": [""], "DOI": ["10.1/a"], "Notes": [notes]})
+        out, stats, _ = tools.analyze_notes_and_add_links(
+            frame, remove_imported_links=True, remove_issp_only_notes=True)
+        # The DOI's line goes; a link that isn't the record's own stays, and so
+        # does an "(ISSP)" line that had no link removed from it.
+        self.assertEqual(out.at[0, "Notes"],
+                         "<p>Cited by: 31</p>\n<p>https://other.org/x. (ISSP)</p>\n<p>(ISSP)</p>")
+        self.assertEqual(stats["ISSP-only Note lines cleared after link removal"], 1)
+
+        out, _stats, _ = tools.analyze_notes_and_add_links(frame, remove_imported_links=True)
+        # Without the ISSP option the line stays, without the stray ". ".
+        self.assertIn("<p>(ISSP)</p>\n<p>https://other.org/x. (ISSP)</p>", out.at[0, "Notes"])
+
 
 if __name__ == "__main__":
     unittest.main()

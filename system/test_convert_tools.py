@@ -196,6 +196,24 @@ class RisPatchNoteColumnsTests(unittest.TestCase):
         self.assertEqual(text.count("ISSP Tags (low)"), 1)
         self.assertIn('ISSP Tags (low) = "SOCNET"', text)
 
+    def test_note_edit_keeps_carried_columns(self):
+        # A Note cleanup (e.g. Note Link Recovery) knows nothing about the
+        # carried columns; rewriting the Notes must not drop their lines.
+        ris = ("TY  - JOUR\nTI  - Paper\nN1  - <p>https://example.org/x. (ISSP)</p>\n"
+               "N1  - Literature Lookup field: ISSP Tags (high) = \"ENV\"\nER  - \n")
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = os.path.join(folder, "in.ris"), os.path.join(folder, "out.ris")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(ris)
+            original = core.read_records_file(source)
+            self.assertEqual(original.loc[0, "ISSP Tags (high)"], "ENV")
+            new = original.copy()
+            new.loc[0, "Notes"] = ""
+            self.assertTrue(core.write_ris_patch(source, original, new, target))
+            loaded = core.read_records_file(target)
+        self.assertEqual(loaded.loc[0, "ISSP Tags (high)"], "ENV")
+        self.assertNotIn("example.org", str(loaded.loc[0].get("Notes", "")))
+
 
 class AddColumnValuesTests(unittest.TestCase):
     def test_adds_missing_items_only_and_keeps_existing(self):

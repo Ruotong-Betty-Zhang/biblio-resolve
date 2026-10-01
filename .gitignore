@@ -65,3 +65,6 @@ Thumbs.db
 /split_by_status.py
 /status composition by publication year.png
 /verification/
+
+*.pdf
+!system/manual/*.pdf

@@ -2094,6 +2094,10 @@ def write_ris_patch(source_path, original_df, new_df, path, note_columns=()):
                 match = _RIS_LINE_RE.match(line)
                 if match:
                     dropping = match.group(1).upper() in read_tags
+                    # Portable "Literature Lookup field" lines were read as their own
+                    # columns, not as part of the Notes value: keep them.
+                    if dropping and match.group(2).startswith(_PORTABLE_FIELD_PREFIX):
+                        dropping = False
                     if dropping and position is None:
                         position = len(kept)
                 if not dropping:

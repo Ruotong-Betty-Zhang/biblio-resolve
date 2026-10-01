@@ -876,6 +876,9 @@ class NoteLinkRecoveryPage(ctk.CTkFrame):
                          f"(in {stats.get('Notes changed by link removal', 0):,} records)")
         if self.remove_issp_var.get():
             lines.append(f"ISSP-only Notes cleared: {stats.get('ISSP-only Notes cleared', 0):,}")
+            if self.remove_links_var.get():
+                lines.append("“Link + ISSP” Note lines cleared (other Note lines kept): "
+                             f"{stats.get('ISSP-only Note lines cleared after link removal', 0):,}")
         _set_readonly_text(self.stats_box, "\n".join(lines))
 
     def on_export(self):
