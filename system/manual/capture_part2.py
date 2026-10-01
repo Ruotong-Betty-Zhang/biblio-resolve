@@ -74,8 +74,12 @@ wait_until(app, lambda: not m.running, timeout=300)
 pump(app, 1.0)
 shot(app, "09_issp_module_tags", [(1, m.title_col), (2, m.tag_col), (3, find(m, "Also resolve GESIS", startswith=True)),
                                   (4, find(m, "Also download each record", startswith=True)),
-                                  (5, m.run_btn, "right"), (6, m.table, "right")])
+                                  (5, m.keyword_tiers), (6, m.run_btn, "right"), (7, m.table, "right")])
 print("issp:", m.status_var.get()[:120])
+# Saved for the "Add values" screenshot in part 3 (ISSP Tags columns kept in the Note).
+with mock.patch.object(ll.filedialog, "asksaveasfilename",
+                       return_value=os.path.join(DEMO, "ISSP_sample_issp_module_tags.ris")),         mock.patch.object(ll.messagebox, "askyesnocancel", return_value=True):
+    m.on_export()
 
 # ---- Note Link Recovery ------------------------------------------------------------
 set_main_tab(app, "Note Link Recovery")

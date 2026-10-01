@@ -17,6 +17,24 @@ def find(root, text, startswith=False):
     raise LookupError(text)
 
 
+class Spot:
+    """A point inside ``widget`` (x as a fraction of its width, y in pixels),
+    for markers on things that are not widgets, such as a paned-window bar."""
+    def __init__(self, widget, fx, y):
+        self.widget, self.fx, self.y = widget, fx, y
+
+    def winfo_rootx(self):
+        return self.widget.winfo_rootx() + int(self.widget.winfo_width() * self.fx)
+
+    def winfo_rooty(self):
+        return self.widget.winfo_rooty() + self.y
+
+    def winfo_width(self):
+        return 0
+
+    winfo_height = winfo_width
+
+
 for name in ("showinfo", "showwarning", "showerror"):
     mock.patch.object(ll.messagebox, name).start()
 app = start_app()
@@ -64,6 +82,22 @@ shot(d, "13_review_dialog", [(1, d.compare_switch), (2, d.view_toggle), (3, d.ed
                              (8, d.message_box), (9, d.review_state), (10, find(d, "Save & Next"), "right")])
 d._close()
 
+# ---- Review & Convert: Add values (ISSP confidence columns -> Keywords) ------------
+open_file(r, os.path.join(DEMO, "ISSP_sample_issp_module_tags.ris"))
+pump(app, 0.5)
+for column in r.column_vars:
+    r.column_vars[column].set(column in ("Title", "Keywords", "ISSP Tags (high)", "ISSP Tags (medium)",
+                                         "ISSP Tags (low)"))
+r.render_page()
+# The capture hides "match by meaning" (as the exe does), so the demo may have no low column.
+source = next(c for c in ("ISSP Tags (low)", "ISSP Tags (medium)", "ISSP Tags (high)") if c in r.df.columns)
+r.add_source.set(source); r.add_target.set("Keywords"); r.add_scope.set(r.SELECTED_SCOPE)
+tagged = [i for i, v in enumerate(r.df[source].fillna("")) if str(v).strip()] or [0]
+r.table.tree.selection_set(str(tagged[0])); r.select_row(tagged[0])
+pump(app, 0.8)
+shot(app, "12b_add_values", [(1, r.add_source), (2, r.add_target), (3, r.add_scope),
+                             (4, find(r, "Add"), "right"), (5, r.table, "right")])
+
 # ---- Statistics ------------------------------------------------------------------
 set_main_tab(app, "Statistics")
 st = app.statistics_page
@@ -75,7 +109,8 @@ st.on_generate(); pump(app, 1.5)
 shot(app, "14_statistics", [(1, st.value_col), (2, st.group_col), (3, st.chart_type),
                             (4, st.generate_btn, "right"), (5, st.overview_table, "inside"),
                             (6, st.canvas.get_tk_widget(), "inside"), (7, st.counts_table, "inside"),
-                            (8, st.export_chart_btn, "right")])
+                            (8, st.export_chart_btn, "right"),
+                            (9, Spot(st.vertical_panes, 0.5, st.vertical_panes.sash_coord(0)[1] + 4))])
 
 # ---- Compare Documents --------------------------------------------------------------
 set_main_tab(app, "Compare Documents")

@@ -1445,6 +1445,7 @@ class IsspModulePage(ctk.CTkFrame):
         use_network_doi_lookup = self.network_doi_var.get()
         use_semantic_matching = self.semantic_var.get()
         keyword_min_confidence = self.KEYWORD_TIERS[self.keyword_tiers.get()]
+        self.run_keyword_tiers = self.keyword_tiers.get()
 
         def worker():
             try:
@@ -1482,9 +1483,13 @@ class IsspModulePage(ctk.CTkFrame):
                     self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
                     self.export_btn.configure(state="normal")
                     self.status_var.set(
-                        f"Classification complete. Tags were written into '{tag_column}'. "
-                        f"Export to save, or open the export in Review & Convert to check "
-                        f"low/medium-confidence rows.")
+                        "Classification complete. Module tags are in the ISSP Tags (high) / "
+                        "(medium) / (low) columns"
+                        + ("" if self.run_keyword_tiers == self.NO_KEYWORD_TIERS else
+                           f" and ({self.run_keyword_tiers}) in '{tag_column}'")
+                        + f"; DATA country tags were added to '{tag_column}'. Export to save, then "
+                        "open the export in Review & Convert to add the tags you accept to the "
+                        "keywords (Add values).")
                     self._show_results(stats)
                 elif kind == "error":
                     self.running = False

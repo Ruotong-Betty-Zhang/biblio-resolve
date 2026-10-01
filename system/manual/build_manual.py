@@ -30,7 +30,7 @@ DARK = colors.HexColor("#1B1B1B")
 GREY = colors.HexColor("#5F6368")
 LIGHT = colors.HexColor("#F3F6FA")
 RED = colors.HexColor("#D62828")
-VERSION = "Version 1.0 · September 2026"
+VERSION = "Version 1.1 · October 2026"
 
 body = ParagraphStyle("body", fontName="Sans", fontSize=9.6, leading=14, textColor=DARK, spaceAfter=5)
 small = ParagraphStyle("small", parent=body, fontSize=8.6, leading=12, textColor=GREY)
@@ -310,7 +310,10 @@ P("Export from Zotero with <i>File → Export Library…</i> (or right-click a c
   "<i>Export Collection…</i>) and choose <b>RIS</b> or <b>CSV</b>. After processing, import the saved file "
   "with <i>File → Import…</i>. Standard fields (DOI, URL, abstract, tags, notes) map to Zotero's own "
   "fields. Extra columns the RIS/BibTeX formats have no field for, such as verification details, are "
-  "stored in each record's Note and are restored as columns when this app opens the file again.")
+  "stored in each record's Note and are restored as columns when this app opens the file again. Before "
+  "saving such columns to RIS or BibTeX, the app lists them and asks: <b>Yes</b> keeps them in the Note, "
+  "<b>No</b> leaves them out of the file, <b>Cancel</b> does not save. CSV and Excel keep every column "
+  "as an ordinary column.")
 callout_box("When a cleanup page (Note Link Recovery or Keyword Cleanup) saves a RIS file as RIS, only "
             "the lines it changed are rewritten. Every other field of your original file, including "
             "volume, issue, pages, ISSN, dates and language, is kept exactly as it was.", "Tip")
@@ -513,22 +516,39 @@ P("The evidence (page title, authors, year, DOI and match scores) is written to 
 # =============================================================================
 H1("8. ISSP Module Tags")
 P("This page identifies which ISSP (International Social Survey Programme) module or modules a publication "
-  "uses, and writes a module tag into its keywords, together with the evidence.")
+  "uses, with the evidence and a confidence level for every tag. The module tags are written into three "
+  "columns, one per confidence level, so you can check them before any of them reach the keywords.")
 figure("09_issp_module_tags", "ISSP Module Tags after classifying a file.", [
     ("Title / Abstract / Notes columns", "The text that is searched for module evidence."),
-    ("Tags/Keywords column", "Where the module tags are added. Existing keywords are kept."),
+    ("Tags/Keywords column", "Where “DATA - &lt;country&gt;” tags (and module tags, if chosen in 5) are "
+                             "added. Existing keywords are never removed."),
     ("Resolve GESIS DOIs online", "Looks up GESIS dataset DOIs (10.4232/1.xxxxx) to find the study they "
                                   "cite. Needed when a record cites only a DOI, not a ZA study number."),
     ("Search the full text", "Also downloads each linked page/PDF and searches it, reaching Methods/Data "
                              "sections an abstract misses. Much slower. It also tags which countries' "
                              "data were used, as “DATA - &lt;country&gt;”."),
+    ("Module tags into the keywords", "<i>None (review later)</i>, the default, keeps module tags only "
+                                      "in the confidence columns. <i>High</i>, <i>High + medium</i> or "
+                                      "<i>All (incl. low)</i> also adds the tags at or above that level "
+                                      "to the keywords."),
     ("Classify records", "Starts the classification."),
     ("Results", "Tag, confidence, status, data countries, where the evidence was found and the exact "
                 "quote or reason."),
 ])
-P("ZA study numbers, resolved GESIS DOIs and exact module names count as <b>confirmed</b> evidence. "
-  "Matches that rely only on topic keywords are flagged <b>lower confidence</b> so you can review them. A "
-  "record can receive more than one module tag.")
+P("A record can receive more than one module tag. Each tag gets one of three confidence levels:")
+table([
+    ["Confidence", "Evidence", "Column"],
+    ["High", "A ZA study number, a resolved GESIS DOI (10.4232/…), or an exact ISSP module name.",
+     "ISSP Tags (high)"],
+    ["Medium", "At least two topic phrases typical of one module.", "ISSP Tags (medium)"],
+    ["Low", "Similar in meaning only (one best tag per record). Check these by hand.", "ISSP Tags (low)"],
+], [0.16, 0.56, 0.28])
+P("Each record also gets a status: <i>Tagged</i>, <i>Not reported</i> (there was readable text but no "
+  "ISSP module was found) or <i>Unavailable</i> (no abstract or full text to analyse).")
+P("When you export to RIS or BibTeX, the three columns are stored in each record's Note (the app asks "
+  "first; see <i>Zotero round trip</i>). Open the exported file in <b>Review &amp; Convert</b> to see them "
+  "as columns again and to add the tags you accept to the keywords with <b>Add values</b> "
+  "(section 11.1).")
 callout_box("The option “Match by meaning” is not included in this version of the app. It needs a "
             "large machine-learning component, so it is shown greyed out. All other matching steps run "
             "normally.", "Note")
@@ -585,7 +605,8 @@ figure("12_review_convert", "A verification result filtered to the records that 
                 "apply a filter)."),
     ("Columns", "<i>All</i> columns, or <i>Ticked only</i> (the columns ticked on the left). The summary "
                 "next to the button shows what will be saved."),
-    ("Save / convert…", "Saves the copy. Columns RIS/BibTeX cannot hold are kept in the record Note."),
+    ("Save / convert…", "Saves the copy. For RIS/BibTeX, the app first lists any columns the format has "
+                        "no field for and asks whether to keep them in the record Note."),
     ("Columns", "Tick the columns to display (and to keep with <i>Ticked only</i>). All / None tick every "
                 "column; <i>Add manual field…</i> creates a new column for your own notes."),
     ("Filter records", "Build conditions (equals, contains, is blank, &gt;, between, …), combine them "
@@ -596,7 +617,22 @@ figure("12_review_convert", "A verification result filtered to the records that 
     ("Manual decision / Notes", "Quick decision for the selected row: Approved, Rejected, Needs review or "
                                 "Unverifiable, plus a note. Click <i>Apply to selected row</i>."),
 ])
-H2("11.1 The review queue")
+H2("11.1 Adding one column's values to another")
+P("<b>Add values</b> copies the items of one column into another column, for example the module tags you "
+  "accept from <i>ISSP Tags (low)</i> into <i>Keywords</i>. Items are separated by semicolons or new "
+  "lines; an item already in the target is not added twice, and nothing is removed.")
+figure("12b_add_values", "Adding a record's checked module tags to its keywords.", [
+    ("Add values of", "The column to copy from. After an ISSP Module Tags run this is preset to "
+                      "<i>ISSP Tags (low)</i>."),
+    ("to", "The column to add to, normally the keywords column. A new column name creates it."),
+    ("for", "<i>Selected record</i>, the <i>Filtered records</i>, or <i>All records</i>."),
+    ("Add", "Adds the values and shows how many records changed. Save with <b>Save / convert…</b>."),
+    ("Records", "Tick the ISSP Tags columns on the left to see them next to the keywords."),
+])
+callout_box("A typical workflow: add <i>ISSP Tags (high)</i> to <i>Keywords</i> for <b>All records</b>, "
+            "then filter on <i>ISSP Tags (medium)</i> or <i>ISSP Tags (low)</i> “is not blank”, check each "
+            "record, and add the tags you agree with for the <b>Selected record</b>.", "Tip")
+H2("11.2 The review queue")
 P("The review window shows one record at a time and compares the record's own values with the values "
   "found by lookup and verification.")
 figure("13_review_dialog", "Reviewing one record: the input record (left) against the retrieved "
@@ -646,6 +682,8 @@ figure("14_statistics", "Item types of a 12,000-record library.", [
     ("Counts", "Each value with its count and percentage. Keyword-type columns are counted per "
                "individual keyword."),
     ("Export table… / Save chart…", "Save the counts as CSV/Excel, or the chart as an image."),
+    ("Resize", "Drag the grey bar between the upper area and the counts table to make either taller, "
+               "and the bar between the overview and the chart to change their widths."),
 ])
 
 # =============================================================================
