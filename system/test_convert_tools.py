@@ -196,6 +196,29 @@ class RisPatchNoteColumnsTests(unittest.TestCase):
         self.assertEqual(text.count("ISSP Tags (low)"), 1)
         self.assertIn('ISSP Tags (low) = "SOCNET"', text)
 
+    def test_ris_writer_splits_only_plain_page_ranges(self):
+        frame = pd.DataFrame({"Title": ["A", "B"], "Pages": ["12-34", "330-330 p."]})
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "out.ris")
+            core.write_records_file(frame, path, "ris")
+            with open(path, encoding="utf-8") as stream:
+                text = stream.read()
+            loaded = core.read_records_file(path)
+        self.assertIn("SP  - 12\nEP  - 34\n", text)
+        self.assertIn("SP  - 330-330 p.\n", text)
+        self.assertEqual(list(loaded["Pages"]), ["12-34", "330-330 p."])
+
+    def test_portable_columns_in_file_lists_carried_columns(self):
+        ris = ("TY  - JOUR\nTI  - A\nN1  - Literature Lookup field: ISSP Tags (high) = \"ENV\"\nER  - \n\n"
+               "TY  - JOUR\nTI  - B\nN1  - Literature Lookup field: ISSP Tags (low) = \"HLTH\"\n"
+               "N1  - Literature Lookup field: ISSP Tags (high) = \"WORK\"\nER  - \n")
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "in.ris")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(ris)
+            self.assertEqual(core.portable_columns_in_file(source), ["ISSP Tags (high)", "ISSP Tags (low)"])
+        self.assertEqual(core.portable_columns_in_file("x.csv"), [])
+
     def test_note_edit_keeps_carried_columns(self):
         # A Note cleanup (e.g. Note Link Recovery) knows nothing about the
         # carried columns; rewriting the Notes must not drop their lines.

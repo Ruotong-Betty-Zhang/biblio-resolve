@@ -567,6 +567,10 @@ class AbstractNoteToolsTests(unittest.TestCase):
         self.assertEqual(stats["ISSP-only Note lines cleared after link removal"], 1)
 
         out, _stats, _ = tools.analyze_notes_and_add_links(frame, remove_imported_links=True)
+        # An escaped <link> leaves no empty "<>" behind.
+        cleaned = tools.remove_links_from_note(
+            "<p>survey report: &lt;http://pgss.org&gt;</p>", ["http://pgss.org"])[0]
+        self.assertEqual(cleaned.replace(" ", ""), "<p>surveyreport:</p>")
         # Without the ISSP option the line stays, without the stray ". ".
         self.assertIn("<p>(ISSP)</p>\n<p>https://other.org/x. (ISSP)</p>", out.at[0, "Notes"])
 

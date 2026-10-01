@@ -133,7 +133,7 @@ def remove_links_from_note(note, links):
     text = URL_RE.sub(drop_bare, text)
     if not removed:
         return clean_value(note), 0
-    text = re.sub(r"\(\s*\)|\[\s*\]", "", text)
+    text = re.sub(r"\(\s*\)|\[\s*\]|&lt;\s*&gt;|<\s*>", "", text)
     # Punctuation that followed a removed link at the start of a line or
     # paragraph ("<p>https://… . (ISSP)</p>" -> "<p>(ISSP)</p>").
     text = re.sub(r"(^|\n|<p\b[^>]*>)[ \t]*[.,;:]+[ \t]*", r"\1", text, flags=re.IGNORECASE)

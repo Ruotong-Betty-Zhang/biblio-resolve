@@ -501,6 +501,7 @@ def _new_column_stats(total_rows):
         "freshly_translated": 0,
         "skipped_already_target_language": 0,
         "skipped_existing_translation": 0,
+        "skipped_empty": 0,
         "by_source_language": {},
     }
 
@@ -567,8 +568,11 @@ def translate_dataframe_fields(dataframe, columns, target_lang, provider, api_ke
             ]
             col_stats["skipped_already_target_language"] += sum(already_target)
 
+            empty = [not keep_as_is[i] and not chunk_originals[i].strip()
+                     for i in range(len(chunk_originals))]
+            col_stats["skipped_empty"] += sum(empty)
             pending = [i for i in range(len(chunk_originals))
-                       if not keep_as_is[i] and not already_target[i]]
+                       if not keep_as_is[i] and not already_target[i] and not empty[i]]
             for i in pending:
                 lang = _detect_language(chunk_originals[i]) or "unknown"
                 col_stats["by_source_language"][lang] = col_stats["by_source_language"].get(lang, 0) + 1
@@ -640,6 +644,8 @@ def format_stats_summary(stats):
     lines = []
     for column, col_stats in stats.items():
         lines.append(f"{column}: {col_stats['total']:,} records")
+        if col_stats.get("skipped_empty"):
+            lines.append(f"  Empty (nothing to translate): {col_stats['skipped_empty']:,}")
         lines.append(
             f"  Already in the target language (skipped): {col_stats['skipped_already_target_language']:,}")
         if col_stats["skipped_existing_translation"]:

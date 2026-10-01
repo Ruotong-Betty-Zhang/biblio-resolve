@@ -317,6 +317,17 @@ class TranslateDataframeFieldsSkipsTargetLanguageTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "Title"], "This is already a perfectly normal English sentence.")
         self.assertEqual((done, total), (1, 1))
 
+    def test_empty_fields_are_skipped_not_counted_as_translated(self):
+        df = pd.DataFrame({"Abstract": ["", "  ", "Dies ist ein deutscher Satz, der übersetzt werden muss."]})
+        with mock.patch.object(tools, "translate_texts", side_effect=lambda texts, *a, **k: ["EN"] * len(texts)):
+            result, _done, _total, stats = tools.translate_dataframe_fields(
+                df, ["Abstract"], "en", "azure", "key", region="eastus", request_delay=0, use_cache=False)
+        self.assertEqual(stats["Abstract"]["skipped_empty"], 2)
+        self.assertEqual(stats["Abstract"]["translated"], 1)
+        self.assertNotIn("unknown", stats["Abstract"]["by_source_language"])
+        self.assertEqual(result.loc[0, "Abstract"], "")
+        self.assertIn("Empty (nothing to translate): 2", tools.format_stats_summary(stats))
+
 
 class TranslateDataframeFieldsTests(unittest.TestCase):
     def test_translates_title_and_abstract_in_place_with_brackets(self):

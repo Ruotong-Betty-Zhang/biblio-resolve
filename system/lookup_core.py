@@ -1861,7 +1861,7 @@ COUNTRY_NAMES = [
     "Ethiopia", "Fiji", "Finland", "France", "Gabon", "Gambia", "Georgia", "Germany", "Ghana",
     "Greece", "Grenada", "Guatemala", "Guinea", "Guinea-Bissau", "Guyana", "Haiti", "Honduras",
     "Hong Kong", "Hungary", "Iceland", "India", "Indonesia", "Iran", "Iraq", "Ireland", "Israel",
-    "Italy", "Jamaica", "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati", "Kosovo", "Kuwait",
+    "Italy", "Jamaica", "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati", "Korea", "Kosovo", "Kuwait",
     "Kyrgyzstan", "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia", "Libya", "Liechtenstein",
     "Lithuania", "Luxembourg", "Macao", "Macau", "Madagascar", "Malawi", "Malaysia", "Maldives",
     "Mali", "Malta", "Marshall Islands", "Mauritania", "Mauritius", "Mexico", "Micronesia",
@@ -2235,6 +2235,24 @@ def _portable_columns_note(row, columns):
 _PORTABLE_FIELD_PREFIX = "Literature Lookup field: "
 
 
+def portable_columns_in_file(path):
+    """Names of the columns a RIS/BibTeX file carries as "Literature Lookup
+    field" Note lines, in first-seen order ([] for other files)."""
+    if not path or os.path.splitext(path)[1].casefold() not in (".ris", ".bib", ".bibtex"):
+        return []
+    found = {}
+    pattern = re.compile(re.escape(_PORTABLE_FIELD_PREFIX) + r"(.+?) = ")
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as stream:
+            for line in stream:
+                match = pattern.search(line)
+                if match:
+                    found.setdefault(match.group(1).strip(), None)
+    except OSError:
+        return []
+    return list(found)
+
+
 def _restore_portable_columns(record):
     """Restore custom columns previously carried through a RIS/BibTeX Note."""
     notes = str(record.get("Notes") or "")
@@ -2406,7 +2424,11 @@ def _write_ris(df, path, portable_columns=None):
                                ("DO", _value(row, "DOI", "doi")),
                                ("UR", _value(row, "Link", "Url", "URL", "url"))]:
                 if value: f.write(f"{tag}  - {value}\n")
-            pages = re.split(r"\s*[-–]+\s*", _value(row, "Pages"), maxsplit=1)
+            # Only a plain range ("12-34", "e1-e9") is split into SP/EP; anything
+            # else ("330-330 p.", "pp. 5 - 9 (part 2)") stays whole in SP.
+            page_text = _value(row, "Pages")
+            plain_range = re.fullmatch(r"(\S+?)\s*[-–]+\s*(\S+)", page_text)
+            pages = [plain_range.group(1), plain_range.group(2)] if plain_range else [page_text]
             if pages[0]:
                 f.write(f"SP  - {pages[0]}\n")
                 if len(pages) > 1 and pages[1]:

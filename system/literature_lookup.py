@@ -1118,8 +1118,9 @@ class AbstractFinderPage(ctk.CTkFrame):
 
     def on_export(self):
         if self.output_df is not None:
+            # A RIS saved as RIS only has its Abstract (and any recovered link) lines rewritten.
             _save_enriched_dataframe(self, self.output_df, self.file_path, "abstracts",
-                                     format_label=self.output_format.get())
+                                     format_label=self.output_format.get(), patch_ris=True)
 
 
 SAME_AS_SOURCE_FORMAT = "Same as source"
@@ -1207,7 +1208,10 @@ def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_labe
             patched = core.write_ris_patch(source_path, original, dataframe, path,
                                            note_columns=note_columns)
         if not patched:
-            keep = [c for c in note_columns if c in dataframe.columns]
+            # Columns the source file carried in its Notes (e.g. the ISSP Tags
+            # columns) travel on in the Note of a rewritten RIS/BibTeX too.
+            carried = core.portable_columns_in_file(source_path) if fmt in ("ris", "bibtex") else []
+            keep = list(dict.fromkeys(c for c in (*note_columns, *carried) if c in dataframe.columns))
             core.write_records_file(dataframe, path, fmt, portable_columns=keep or None)
     except Exception as exc:
         messagebox.showerror("Export failed", f"Couldn't save the enriched file:\n{exc}")
@@ -4045,8 +4049,10 @@ class VerificationPage(ctk.CTkFrame):
         try:
             portable_columns = None
             if fmt in {"ris", "bibtex"}:
+                # The verification columns, plus any the source carried in its Notes.
                 portable_columns = [
-                    column for column in self.verification_added_columns
+                    column for column in dict.fromkeys(
+                        [*self.verification_added_columns, *core.portable_columns_in_file(self.file_path)])
                     if column in export_df.columns
                 ]
             core.write_records_file(
@@ -4573,8 +4579,11 @@ class BatchLookupPage(ctk.CTkFrame):
         )
         if not path:
             return
+        # Columns the source carried in its Notes (e.g. ISSP Tags) stay in the Note.
+        carried = ([c for c in core.portable_columns_in_file(self.file_path) if c in self.output_df.columns]
+                   if fmt in ("ris", "bibtex") else None)
         try:
-            core.write_records_file(self.output_df, path, fmt)
+            core.write_records_file(self.output_df, path, fmt, portable_columns=carried or None)
         except Exception as e:
             messagebox.showerror("Save failed", f"Couldn't save the file:\n{e}")
             return
@@ -5642,8 +5651,9 @@ class TranslatePage(ctk.CTkFrame):
 
     def on_export(self):
         if self.output_df is not None:
+            # A RIS saved as RIS only has its Title/Abstract lines rewritten.
             _save_enriched_dataframe(self, self.output_df, self.file_path, "translated",
-                                     format_label=self.output_format.get())
+                                     format_label=self.output_format.get(), patch_ris=True)
 
 
 # ---------------------------------------------------------------------------

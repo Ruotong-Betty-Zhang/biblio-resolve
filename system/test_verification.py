@@ -117,6 +117,10 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(kept_only_country, ["Germany"])
         _, kept_upper, _ = core.clean_uppercase_tags("IST; Germany")
         self.assertEqual(kept_upper, ["IST"])
+        # "Korea" on its own (as in the library's "AUTH - Korea") is a country too.
+        _, kept_korea, _ = core.clean_tags("AUTH - Korea; DATA - South Korea", keep_uppercase=True,
+                                           keep_countries=True)
+        self.assertEqual(kept_korea, ["AUTH - Korea", "DATA - South Korea"])
 
     def test_tag_cleanup_supports_newline_separator(self):
         cleaned, kept, removed = core.clean_uppercase_tags("IST\nimported\nMODULE A", "New line")
