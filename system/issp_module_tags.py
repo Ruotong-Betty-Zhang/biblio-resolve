@@ -818,6 +818,11 @@ def resolve_gesis_doi_title(doi, session=None, timeout=15):
 
 
 _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+# One column per confidence level with the module codes found at that level,
+# so a reviewer can add a whole level (or single records) to the keywords
+# with Review & Convert's "Add column values" tool.
+CONFIDENCE_TAG_COLUMNS = {"high": "ISSP Tags (high)", "medium": "ISSP Tags (medium)",
+                          "low": "ISSP Tags (low)"}
 
 
 def classify_record(text, doi_resolver=None, embedding_matcher=None):
@@ -915,13 +920,15 @@ def classify_record(text, doi_resolver=None, embedding_matcher=None):
     return sorted(found.values(), key=lambda r: (-_CONFIDENCE_RANK[r["confidence"]], r["tag"]))
 
 
-def _merge_tags(value, new_tags, is_managed):
-    """Replace only tags this feature previously assigned (per
-    `is_managed`), preserving every other user tag (same convention as
-    _replace_abstract_review_tag), then append `new_tags`."""
+def _merge_tags(value, new_tags):
+    """Keep every existing tag and append the new ones that are missing.
+
+    Existing module / DATA tags are never removed: a library's tags are often
+    curated by hand, and a record where this run finds no evidence (no
+    abstract, paywalled full text) says nothing about whether the curated
+    tag is wrong. Removing a tag is a decision for a person to make."""
     tags = [item.strip() for item in re.split(r"\s*(?:;|\n|,)\s*", clean_value(value))
             if item.strip()]
-    tags = [item for item in tags if not is_managed(item)]
     for tag in new_tags:
         if tag and tag not in tags:
             tags.append(tag)
@@ -929,13 +936,13 @@ def _merge_tags(value, new_tags, is_managed):
 
 
 def replace_issp_module_tags(value, new_tags):
-    """`new_tags` is an iterable of zero or more module tag codes to add."""
-    return _merge_tags(value, new_tags, lambda item: item in ISSP_MODULE_TAG_CODES)
+    """Add module tag codes (``new_tags``); existing tags are all kept."""
+    return _merge_tags(value, new_tags)
 
 
 def replace_data_country_tags(value, new_tags):
-    """`new_tags` is an iterable of zero or more "DATA - <country>" tags."""
-    return _merge_tags(value, new_tags, lambda item: item.startswith("DATA - "))
+    """Add "DATA - <country>" tags (``new_tags``); existing tags are all kept."""
+    return _merge_tags(value, new_tags)
 
 
 # ---------------------------------------------------------------------------
@@ -1115,10 +1122,18 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
                      title_column=None, use_network_doi_lookup=True, use_semantic_matching=True,
                      fetch_full_text=False, full_text_pdf_pages=15, request_delay=0.5,
                      use_full_text_cache=True, semantic_matcher=None, session=None,
-                     progress_callback=None, cancel_event=None):
+                     progress_callback=None, cancel_event=None, keyword_min_confidence=None):
     """Classify every record - possibly with more than one module tag each
     - and write the result into columns (semicolon-separated when there is
-    more than one) plus merge every tag found into `tag_column`.
+    more than one) and add the "DATA - <country>" tags found into
+    `tag_column`.
+
+    Module tags go into one column per confidence level ("ISSP Tags
+    (high)" etc.) for review, and by default not into `tag_column`: there
+    their confidence would no longer be visible. Set
+    `keyword_min_confidence` to "high", "medium" or "low" to also add the
+    module tags at or above that level to `tag_column`. Existing tags in
+    `tag_column` are never removed.
     `text_columns` is an iterable of column names whose values are
     concatenated as the text to search (typically Title, Abstract, and/or
     Notes/Extra). `title_column`, if given, is the one of those that holds
@@ -1183,9 +1198,9 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
         tag_column = "Manual Tags"
         frame[tag_column] = ""
 
-    for column in ("ISSP Module Tag", "ISSP Module Confidence", "ISSP Module Status",
-                   "ISSP Module Status Reason", "ISSP Module Method", "ISSP Module Evidence",
-                   "ISSP Module Evidence Location", "ISSP Module Evidence Quote",
+    for column in ("ISSP Module Tag", "ISSP Module Confidence", *CONFIDENCE_TAG_COLUMNS.values(),
+                   "ISSP Module Status", "ISSP Module Status Reason", "ISSP Module Method",
+                   "ISSP Module Evidence", "ISSP Module Evidence Location", "ISSP Module Evidence Quote",
                    "ISSP Data Countries", "ISSP Data Country Evidence",
                    "ISSP Full Text Fetch Status"):
         frame[column] = ""
@@ -1282,6 +1297,9 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
         matched = [item for item in items if item["tag"]]
         frame.at[index, "ISSP Module Tag"] = "; ".join(item["tag"] for item in matched)
         frame.at[index, "ISSP Module Confidence"] = "; ".join(item["confidence"] for item in matched)
+        for confidence, column in CONFIDENCE_TAG_COLUMNS.items():
+            frame.at[index, column] = "; ".join(
+                item["tag"] for item in matched if item["confidence"] == confidence)
         status, reason = _status_for(matched, segments, fetch_statuses[index])
         frame.at[index, "ISSP Module Status"] = status
         frame.at[index, "ISSP Module Status Reason"] = reason
@@ -1319,7 +1337,13 @@ def tag_issp_modules(dataframe, text_columns, url_column=None, doi_column=None, 
         frame.at[index, "ISSP Data Country Evidence"] = " | ".join(country_evidence)
 
         current_tags = frame.at[index, tag_column]
-        current_tags = replace_issp_module_tags(current_tags, [item["tag"] for item in matched])
+        # Module tags reach the keywords only when asked (keyword_min_confidence);
+        # every match (with its confidence and evidence) stays in the
+        # ISSP Module / ISSP Tags columns for review.
+        if keyword_min_confidence:
+            keyword_tags = [item["tag"] for item in matched if _CONFIDENCE_RANK[item["confidence"]]
+                            >= _CONFIDENCE_RANK[keyword_min_confidence]]
+            current_tags = replace_issp_module_tags(current_tags, keyword_tags)
         current_tags = replace_data_country_tags(
             current_tags, [data_country_tag(country) for country in found_countries])
         frame.at[index, tag_column] = current_tags

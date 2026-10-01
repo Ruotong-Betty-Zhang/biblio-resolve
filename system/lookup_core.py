@@ -2054,14 +2054,18 @@ def _patch_value(value):
     return str(value).strip()
 
 
-def write_ris_patch(source_path, original_df, new_df, path):
+def write_ris_patch(source_path, original_df, new_df, path, note_columns=()):
     """Write ``new_df`` as a copy of the RIS file it was read from, replacing
     only the lines of fields whose values changed (Notes, URL, DOI, keywords,
     abstract, title). Every other line - VL, IS, SN, T2, DA, AU, ... - is kept
     byte for byte, so a Note cleanup can't lose or reformat anything else.
 
     ``original_df`` is the file as read, row-aligned with ``new_df``. Columns
-    that only exist in ``new_df`` (audit columns) are ignored. Returns False,
+    that only exist in ``new_df`` (audit columns) are ignored, except those
+    named in ``note_columns``: they are stored as portable "Literature Lookup
+    field" lines in the record Note (replacing earlier lines for the same
+    column), which this app restores as columns when it reads the file.
+    Returns False,
     writing nothing, when the change can't be expressed as such a patch (row
     count differs, or another existing column changed); the caller then falls
     back to write_records_file."""
@@ -2071,7 +2075,7 @@ def write_ris_patch(source_path, original_df, new_df, path):
     original_df = original_df.reset_index(drop=True)
     new_df = new_df.reset_index(drop=True)
     for column in original_df.columns:
-        if column in _RIS_PATCH_FIELDS or column not in new_df.columns:
+        if column in _RIS_PATCH_FIELDS or column not in new_df.columns or column in note_columns:
             continue
         if not original_df[column].map(_patch_value).equals(new_df[column].map(_patch_value)):
             return False
@@ -2105,6 +2109,17 @@ def write_ris_patch(source_path, original_df, new_df, path):
                                  if (_RIS_LINE_RE.match(kept[i]) or [None, ""])[1].upper() == "ER"),
                                 len(kept))
             block = kept[:position] + [f"{write_tag}  - {value}" for value in values] + kept[position:]
+        if note_columns:
+            prefixes = tuple(f"N1  - {_PORTABLE_FIELD_PREFIX}{column} = " for column in note_columns)
+            block = [line for line in block if not line.startswith(prefixes)]
+            carried = [f"N1  - {_PORTABLE_FIELD_PREFIX}{column} = "
+                       f"{json.dumps(_patch_value(new_df.at[index, column]), ensure_ascii=False)}"
+                       for column in note_columns
+                       if column in new_df.columns and _patch_value(new_df.at[index, column])]
+            if carried:
+                end = next((k for k in range(len(block) - 1, -1, -1)
+                            if (_RIS_LINE_RE.match(block[k]) or [None, ""])[1].upper() == "ER"), len(block))
+                block = block[:end] + carried + block[end:]
         output.append(block)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         for block in output:

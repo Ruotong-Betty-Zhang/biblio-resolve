@@ -15,15 +15,12 @@ review needed) - see issp_module_tags.py's module docstring for the tier
 design this checks, and stats_tools.py for the column-classification ideas
 this module borrows the "split on ';'" convention from.
 
-IMPORTANT: this module exists partly to guard against a real hazard.
-tag_issp_modules()'s tag-merging (see issp_module_tags._merge_tags) treats
-ANY occurrence of one of its 12 module codes in a tag column as something
-the app must have written previously, and replaces it. So once a file has
-been run through the classifier with tag-writing enabled, it no longer
-reliably contains GESIS's original codes for records the classifier
-disagreed with (or missed). Ground truth must always come from a file that
-predates the app's very first run, never from a "..._issp_module_tags*"
-export.
+IMPORTANT: ground truth must always come from a file that predates the
+app's very first run, never from a "..._issp_module_tags*" export. When
+tag_issp_modules() is asked to write module tags into the keywords
+(keyword_min_confidence), those predicted codes become indistinguishable
+from GESIS's own, and older versions of the app also removed codes the
+classifier disagreed with.
 """
 from __future__ import annotations
 

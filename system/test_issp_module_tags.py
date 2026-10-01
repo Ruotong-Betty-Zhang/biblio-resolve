@@ -323,13 +323,11 @@ class IsspModuleTagsTests(unittest.TestCase):
 
     # --- replace_issp_module_tags ------------------------------------------
 
-    def test_replace_issp_module_tags_preserves_other_tags(self):
+    def test_replace_issp_module_tags_keeps_every_existing_tag(self):
+        # Existing module tags may be curated by hand: they are never removed.
         updated = tagger.replace_issp_module_tags("WORKORI; MYPROJECT; some-other-tag", ["RELIG"])
         tags = [t.strip() for t in updated.split(";")]
-        self.assertIn("MYPROJECT", tags)
-        self.assertIn("some-other-tag", tags)
-        self.assertIn("RELIG", tags)
-        self.assertNotIn("WORKORI", tags)
+        self.assertEqual(tags, ["WORKORI", "MYPROJECT", "some-other-tag", "RELIG"])
 
     def test_replace_issp_module_tags_handles_empty_existing_value(self):
         self.assertEqual(tagger.replace_issp_module_tags("", ["ENV"]), "ENV")
@@ -340,10 +338,11 @@ class IsspModuleTagsTests(unittest.TestCase):
         tags = [t.strip() for t in updated.split(";")]
         self.assertEqual(set(tags), {"MYPROJECT", "ENV", "ROG"})
 
-    def test_replace_issp_module_tags_with_no_new_tags_only_strips_old_ones(self):
-        updated = tagger.replace_issp_module_tags("RELIG; MYPROJECT", [])
-        tags = [t.strip() for t in updated.split(";")]
-        self.assertEqual(tags, ["MYPROJECT"])
+    def test_replace_issp_module_tags_with_no_new_tags_changes_nothing(self):
+        self.assertEqual(tagger.replace_issp_module_tags("RELIG; MYPROJECT", []), "RELIG; MYPROJECT")
+
+    def test_existing_tag_is_not_duplicated(self):
+        self.assertEqual(tagger.replace_issp_module_tags("ENV; MYPROJECT", ["ENV"]), "ENV; MYPROJECT")
 
     # --- tag_issp_modules (batch) -------------------------------------------
 
@@ -360,7 +359,8 @@ class IsspModuleTagsTests(unittest.TestCase):
         })
         output_df, stats, tag_column = tagger.tag_issp_modules(
             df, text_columns=["Title", "Abstract"], doi_column="DOI",
-            tag_column="Keywords", use_network_doi_lookup=False, use_semantic_matching=False)
+            tag_column="Keywords", use_network_doi_lookup=False, use_semantic_matching=False,
+            keyword_min_confidence="medium")
 
         self.assertEqual(tag_column, "Keywords")
         self.assertEqual(output_df.loc[0, "ISSP Module Tag"], "RELIG")
@@ -450,6 +450,49 @@ class IsspModuleTagsTests(unittest.TestCase):
                          "HLTH: " + tagger.SEMANTIC_LOCATION)
         self.assertEqual(output_df.loc[0, "ISSP Module Evidence Quote"], "")
 
+    def test_module_tags_stay_out_of_keywords_by_default(self):
+        df = pd.DataFrame({"Title": ["Paper A"],
+                           "Abstract": ["We use ISSP 2018 data (ZA7570) from Germany and France."],
+                           "Keywords": ["MYPROJECT"]})
+        output_df, _stats, _column = tagger.tag_issp_modules(
+            df, text_columns=["Title", "Abstract"], tag_column="Keywords",
+            use_network_doi_lookup=False, use_semantic_matching=False)
+        # The module tag is only in the review columns; country tags still go in.
+        self.assertEqual(output_df.loc[0, "ISSP Tags (high)"], "RELIG")
+        keywords = output_df.loc[0, "Keywords"].split("; ")
+        self.assertNotIn("RELIG", keywords)
+        self.assertIn("MYPROJECT", keywords)
+        self.assertTrue(any(tag.startswith("DATA - ") for tag in keywords), keywords)
+
+    def test_low_confidence_tags_stay_out_of_keywords_at_medium(self):
+        class FakeMatcher:
+            def classify_batch(self, texts):
+                return [("HLTH", 0.6) for _ in texts]
+
+        df = pd.DataFrame({"Title": ["Paper A", "Paper B"],
+                           "Abstract": ["Nothing specific here.", "We use ISSP data (ZA7570)."],
+                           "Keywords": ["ENV; MYPROJECT", ""]})
+        output_df, _stats, _column = tagger.tag_issp_modules(
+            df, text_columns=["Title", "Abstract"], tag_column="Keywords",
+            use_network_doi_lookup=False, semantic_matcher=FakeMatcher(), keyword_min_confidence="medium")
+        # The meaning-only match is reported, but not written into the keywords;
+        # the existing curated ENV tag is kept even though no evidence was found.
+        self.assertEqual(output_df.loc[0, "ISSP Module Tag"], "HLTH")
+        self.assertEqual(output_df.loc[0, "ISSP Module Confidence"], "low")
+        self.assertEqual(output_df.loc[0, "Keywords"], "ENV; MYPROJECT")
+        # A high-confidence match (ZA number) is added.
+        self.assertIn("RELIG", output_df.loc[1, "Keywords"])  # ZA7570 = Religion III
+
+        # One column per confidence level, for review.
+        self.assertEqual(output_df.loc[0, "ISSP Tags (low)"], "HLTH")
+        self.assertEqual(output_df.loc[0, "ISSP Tags (high)"], "")
+        self.assertEqual(output_df.loc[1, "ISSP Tags (high)"], "RELIG")
+
+        output_df, _stats, _column = tagger.tag_issp_modules(
+            df, text_columns=["Title", "Abstract"], tag_column="Keywords",
+            use_network_doi_lookup=False, semantic_matcher=FakeMatcher(), keyword_min_confidence="low")
+        self.assertEqual(output_df.loc[0, "Keywords"], "ENV; MYPROJECT; HLTH")
+
     def test_long_sentence_quote_is_shortened_around_the_match(self):
         long_sentence = ("word " * 100) + "ZA7570" + (" word" * 100) + "."
         df = pd.DataFrame({"Abstract": [long_sentence]})
@@ -493,7 +536,7 @@ class IsspModuleTagsTests(unittest.TestCase):
         })
         output_df, _stats, tag_column = tagger.tag_issp_modules(
             df, text_columns=["Title", "Abstract"], use_network_doi_lookup=False,
-            use_semantic_matching=False)
+            use_semantic_matching=False, keyword_min_confidence="high")
         self.assertEqual(tag_column, "Tags")
         self.assertEqual(output_df.loc[0, "Tags"], "RELIG")
 
@@ -501,7 +544,7 @@ class IsspModuleTagsTests(unittest.TestCase):
         df = pd.DataFrame({"Title": ["Paper A"], "Abstract": ["Uses ZA7570 dataset."]})
         output_df, _stats, tag_column = tagger.tag_issp_modules(
             df, text_columns=["Title", "Abstract"], use_network_doi_lookup=False,
-            use_semantic_matching=False)
+            use_semantic_matching=False, keyword_min_confidence="high")
         self.assertEqual(tag_column, "Manual Tags")
         self.assertEqual(output_df.loc[0, "Manual Tags"], "RELIG")
 
@@ -662,7 +705,7 @@ class IsspModuleTagsTests(unittest.TestCase):
         updated = tagger.replace_data_country_tags(
             "RELIG; MYPROJECT; DATA - Japan", ["DATA - Germany"])
         tags = [t.strip() for t in updated.split(";")]
-        self.assertEqual(set(tags), {"RELIG", "MYPROJECT", "DATA - Germany"})
+        self.assertEqual(tags, ["RELIG", "MYPROJECT", "DATA - Japan", "DATA - Germany"])
 
     def test_data_country_tag_format(self):
         self.assertEqual(tagger.data_country_tag("Germany"), "DATA - Germany")

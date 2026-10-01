@@ -170,6 +170,46 @@ class RisPatchTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class RisPatchNoteColumnsTests(unittest.TestCase):
+    def test_new_columns_travel_in_the_note_and_come_back(self):
+        ris = "TY  - JOUR\nTI  - Paper\nKW  - ENV\nN1  - A real note\nER  - \n"
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = os.path.join(folder, "in.ris"), os.path.join(folder, "out.ris")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(ris)
+            original = core.read_records_file(source)
+            new = original.copy()
+            new["ISSP Tags (low)"] = ["HLTH; RELIG"]
+            self.assertTrue(core.write_ris_patch(source, original, new, target,
+                                                 note_columns=["ISSP Tags (low)"]))
+            loaded = core.read_records_file(target)
+            self.assertEqual(loaded.loc[0, "ISSP Tags (low)"], "HLTH; RELIG")
+            self.assertEqual(loaded.loc[0, "Notes"], "A real note")
+            # A second run replaces the carried value instead of adding another line.
+            again = loaded.copy()
+            again["ISSP Tags (low)"] = ["SOCNET"]
+            second = os.path.join(folder, "out2.ris")
+            self.assertTrue(core.write_ris_patch(target, loaded, again, second,
+                                                 note_columns=["ISSP Tags (low)"]))
+            with open(second, encoding="utf-8") as stream:
+                text = stream.read()
+        self.assertEqual(text.count("ISSP Tags (low)"), 1)
+        self.assertIn('ISSP Tags (low) = "SOCNET"', text)
+
+
+class AddColumnValuesTests(unittest.TestCase):
+    def test_adds_missing_items_only_and_keeps_existing(self):
+        frame = pd.DataFrame({"Low": ["HLTH; RELIG", "", "ENV"], "Keywords": ["RELIG; MINE", "X", ""]})
+        changed = tools.add_column_values(frame, [0, 1, 2], "Low", "Keywords")
+        self.assertEqual(changed, 2)
+        self.assertEqual(list(frame["Keywords"]), ["RELIG; MINE; HLTH", "X", "ENV"])
+
+    def test_only_given_rows_and_new_target_column(self):
+        frame = pd.DataFrame({"Low": ["HLTH", "ENV"]})
+        tools.add_column_values(frame, [1], "Low", "Accepted")
+        self.assertEqual(list(frame["Accepted"]), ["", "ENV"])
+
+
 class SplitAuthorsTests(unittest.TestCase):
     def test_organisation_with_and_is_one_author(self):
         self.assertEqual(core._split_authors("Department of Economic and Social Affairs"),

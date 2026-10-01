@@ -1142,6 +1142,26 @@ def _add_export_format_menu(parent, width=170):
     return menu
 
 
+def _ask_note_columns(parent, columns, fmt):
+    """Before saving to RIS/BibTeX, say which columns have no field there.
+    Returns True to keep them in each record's Note, False to leave them
+    out, or None to cancel the save."""
+    if not columns or fmt not in ("ris", "bibtex"):
+        return True
+    names = "\n".join(f"  • {c}" for c in columns[:12])
+    if len(columns) > 12:
+        names += f"\n  … and {len(columns) - 12} more"
+    return messagebox.askyesnocancel(
+        "Columns without a field",
+        f"{'RIS' if fmt == 'ris' else 'BibTeX'} has no field for these column(s):\n{names}\n\n"
+        "Yes: keep them in each record's Note (one \"Literature Lookup field: …\" line "
+        "each). This app turns them back into columns when it opens the file; Zotero "
+        "shows them as note text.\n"
+        "No: leave these columns out of the file.\n"
+        "Cancel: don't save. (CSV or Excel keeps them as ordinary columns.)",
+        parent=parent)
+
+
 def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_label=None,
                              patch_ris=False, note_columns=()):
     """Export a page's result. With ``patch_ris`` (pages that only edit
@@ -1170,6 +1190,12 @@ def _save_enriched_dataframe(parent, dataframe, source_path, suffix, format_labe
     formats = {".csv": "csv", ".xlsx": "excel", ".ris": "ris", ".bib": "bibtex",
                ".bibtex": "bibtex", ".json": "csl_json"}
     fmt = formats.get(ext, default_format)
+    keep_notes = _ask_note_columns(parent, [c for c in note_columns if c in dataframe.columns], fmt)
+    if keep_notes is None:
+        return
+    if not keep_notes:
+        dataframe = dataframe.drop(columns=[c for c in note_columns if c in dataframe.columns])
+        note_columns = ()
     patched = False
     try:
         if (patch_ris and fmt == "ris"
@@ -1250,6 +1276,11 @@ def _style_chart_axes(figure, axes):
 # ---------------------------------------------------------------------------
 
 class IsspModulePage(ctk.CTkFrame):
+    # Segmented-button label -> tag_issp_modules(keyword_min_confidence=...)
+    NO_KEYWORD_TIERS = "None (review later)"
+    KEYWORD_TIERS = {NO_KEYWORD_TIERS: None, "High": "high", "High + medium": "medium",
+                     "All (incl. low)": "low"}
+
     def __init__(self, master):
         super().__init__(master, fg_color="transparent")
         self.df = self.output_df = None
@@ -1311,13 +1342,20 @@ class IsspModulePage(ctk.CTkFrame):
                  "Data sections an abstract alone would miss, and also looks for which "
                  "country(ies)' data the record used, tagged \"DATA - <country>\". Uses OCR for "
                  "scanned PDFs when Tesseract is installed.").pack(anchor="w", pady=(4, 0))
-        self.low_to_keywords_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            settings, variable=self.low_to_keywords_var,
-            text="Also add low-confidence tags (meaning-only matches) to the keywords — off by "
-                 "default: in the keywords a tag's confidence is no longer visible. Every match, "
-                 "with its confidence and evidence, is always listed in the results and CSV/Excel "
-                 "exports. Existing keyword tags are never removed.").pack(anchor="w", pady=(4, 0))
+        keyword_row = ctk.CTkFrame(settings, fg_color="transparent")
+        keyword_row.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(keyword_row, text="Module tags into the keywords:").pack(side="left", padx=(0, 8))
+        self.keyword_tiers = ctk.CTkSegmentedButton(
+            keyword_row, values=list(self.KEYWORD_TIERS))
+        self.keyword_tiers.set(self.NO_KEYWORD_TIERS)
+        self.keyword_tiers.pack(side="left")
+        ctk.CTkLabel(
+            settings, justify="left", anchor="w", wraplength=760,
+            text="By default module tags go only into the ISSP Tags (high) / (medium) / (low) "
+                 "columns, which are saved with the file; add them to the keywords later on the "
+                 "Review & Convert page (\"Add values\"). \"DATA - <country>\" tags are always "
+                 "added to the keywords. Existing keyword tags are never removed.").pack(
+                     fill="x", pady=(2, 0))
 
         run_row = ctk.CTkFrame(self, fg_color="transparent")
         run_row.pack(fill="x", padx=4, pady=(0, 6))
@@ -1406,7 +1444,7 @@ class IsspModulePage(ctk.CTkFrame):
             if fetch_full_text else "Classifying…")
         use_network_doi_lookup = self.network_doi_var.get()
         use_semantic_matching = self.semantic_var.get()
-        keyword_min_confidence = "low" if self.low_to_keywords_var.get() else "medium"
+        keyword_min_confidence = self.KEYWORD_TIERS[self.keyword_tiers.get()]
 
         def worker():
             try:
@@ -2364,6 +2402,11 @@ class ManualReviewPage(ctk.CTkFrame):
         typed = os.path.splitext(path)[1].lower().replace(".bibtex", ".bib").replace(".xls", ".xlsx")
         fmt = next((f for f, e in self.EXPORT_FORMATS.values() if e == typed), fmt)
         portable = convert_tools.portable_columns_for(list(frame.columns), fmt)
+        keep_notes = _ask_note_columns(self, portable, fmt)
+        if keep_notes is None:
+            return
+        if not keep_notes:
+            frame, portable = frame.drop(columns=portable), []
         try:
             core.write_records_file(frame, path, fmt, portable_columns=portable)
         except Exception as exc:

@@ -104,6 +104,36 @@ def filter_dataframe(df, conditions, mode="AND"):
     return df[mask]
 
 
+_VALUE_LIST_SPLIT = re.compile(r"\s*(?:;|\n)\s*")
+
+
+def split_values(value):
+    """A semicolon/line-separated cell as a list of items (keywords, tags)."""
+    text = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+    return [item for item in _VALUE_LIST_SPLIT.split(text.strip()) if item]
+
+
+def add_column_values(df, indices, source, target):
+    """Append the items of ``source`` to ``target`` (as "; "-separated
+    tags) for the rows in ``indices``; items already in ``target`` are not
+    repeated and nothing is removed. ``target`` is created if missing.
+    Returns the number of rows that changed."""
+    if source not in df.columns:
+        raise KeyError(f"Column not found: {source}")
+    if target not in df.columns:
+        df[target] = ""
+    elif df[target].dtype != object:
+        df[target] = df[target].astype(object)
+    changed = 0
+    for index in indices:
+        current = split_values(df.at[index, target])
+        additions = [item for item in split_values(df.at[index, source]) if item not in current]
+        if additions:
+            df.at[index, target] = "; ".join(current + additions)
+            changed += 1
+    return changed
+
+
 def portable_columns_for(columns, fmt):
     """Columns the target format has no native tag for (kept via the Note)."""
     groups = NATIVE_FIELD_GROUPS.get(fmt)
