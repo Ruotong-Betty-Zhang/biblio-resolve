@@ -30,7 +30,7 @@ DARK = colors.HexColor("#1B1B1B")
 GREY = colors.HexColor("#5F6368")
 LIGHT = colors.HexColor("#F3F6FA")
 RED = colors.HexColor("#D62828")
-VERSION = "Version 1.1 · October 2026"
+VERSION = "Version 1.2 · October 2026"
 
 body = ParagraphStyle("body", fontName="Sans", fontSize=9.6, leading=14, textColor=DARK, spaceAfter=5)
 small = ParagraphStyle("small", parent=body, fontSize=8.6, leading=12, textColor=GREY)
@@ -517,7 +517,7 @@ P("The evidence (page title, authors, year, DOI and match scores) is written to 
 H1("8. ISSP Module Tags")
 P("This page identifies which ISSP (International Social Survey Programme) module or modules a publication "
   "uses, with the evidence and a confidence level for every tag. The module tags are written into three "
-  "columns, one per confidence level, so you can check them before any of them reach the keywords.")
+  "columns, one per kind of evidence, so you can check them before any of them reach the keywords.")
 figure("09_issp_module_tags", "ISSP Module Tags after classifying a file.", [
     ("Title / Abstract / Notes columns", "The text that is searched for module evidence."),
     ("Tags/Keywords column", "Where “DATA - &lt;country&gt;” tags (and module tags, if chosen in 5) are "
@@ -528,21 +528,24 @@ figure("09_issp_module_tags", "ISSP Module Tags after classifying a file.", [
                              "sections an abstract misses. Much slower. It also tags which countries' "
                              "data were used, as “DATA - &lt;country&gt;”."),
     ("Module tags into the keywords", "<i>None (review later)</i>, the default, keeps module tags only "
-                                      "in the confidence columns. <i>High</i>, <i>High + medium</i> or "
-                                      "<i>All (incl. low)</i> also adds the tags at or above that level "
-                                      "to the keywords."),
+                                      "in the three ISSP Tags columns. <i>ID or name</i>, <i>+ keywords</i> "
+                                      "or <i>All (+ similarity)</i> also adds those columns' tags to the "
+                                      "keywords."),
     ("Classify records", "Starts the classification."),
     ("Results", "Tag, confidence, status, data countries, where the evidence was found and the exact "
                 "quote or reason."),
 ])
-P("A record can receive more than one module tag. Each tag gets one of three confidence levels:")
+P("A record can receive more than one module tag. Each tag goes into one of three columns, by the "
+  "evidence behind it, from strongest to weakest:")
 table([
-    ["Confidence", "Evidence", "Column"],
-    ["High", "A ZA study number, a resolved GESIS DOI (10.4232/…), or an exact ISSP module name.",
-     "ISSP Tags (high)"],
-    ["Medium", "At least two topic phrases typical of one module.", "ISSP Tags (medium)"],
-    ["Low", "Similar in meaning only (one best tag per record). Check these by hand.", "ISSP Tags (low)"],
-], [0.16, 0.56, 0.28])
+    ["Column", "Evidence"],
+    ["ISSP Tags (ID or name)", "A ZA study number, a resolved GESIS DOI (10.4232/…), or an exact ISSP module name "
+             "(e.g. <i>Work Orientations</i>, <i>Citizenship</i>). The single words <i>religion</i> "
+             "and <i>environment</i> count only in a sentence that also says “ISSP” or “module”."],
+    ["ISSP Tags (keywords)", "<i>Religious</i>, <i>religiosity</i>, <i>environmental</i> and similar "
+                             "word forms in such a sentence; or at least two topic phrases typical of one module."],
+    ["ISSP Tags (similarity)", "Similar in meaning only (one best tag per record). Check these by hand."],
+], [0.3, 0.7])
 P("Each record also gets a status: <i>Tagged</i>, <i>Not reported</i> (there was readable text but no "
   "ISSP module was found) or <i>Unavailable</i> (no abstract or full text to analyse).")
 P("When you export to RIS or BibTeX, the three columns are stored in each record's Note (the app asks "
@@ -619,18 +622,18 @@ figure("12_review_convert", "A verification result filtered to the records that 
 ])
 H2("11.1 Adding one column's values to another")
 P("<b>Add values</b> copies the items of one column into another column, for example the module tags you "
-  "accept from <i>ISSP Tags (low)</i> into <i>Keywords</i>. Items are separated by semicolons or new "
+  "accept from <i>ISSP Tags (similarity)</i> into <i>Keywords</i>. Items are separated by semicolons or new "
   "lines; an item already in the target is not added twice, and nothing is removed.")
 figure("12b_add_values", "Adding a record's checked module tags to its keywords.", [
     ("Add values of", "The column to copy from. After an ISSP Module Tags run this is preset to "
-                      "<i>ISSP Tags (low)</i>."),
+                      "<i>ISSP Tags (similarity)</i>."),
     ("to", "The column to add to, normally the keywords column. A new column name creates it."),
     ("for", "<i>Selected record</i>, the <i>Filtered records</i>, or <i>All records</i>."),
     ("Add", "Adds the values and shows how many records changed. Save with <b>Save / convert…</b>."),
     ("Records", "Tick the ISSP Tags columns on the left to see them next to the keywords."),
 ])
-callout_box("A typical workflow: add <i>ISSP Tags (high)</i> to <i>Keywords</i> for <b>All records</b>, "
-            "then filter on <i>ISSP Tags (medium)</i> or <i>ISSP Tags (low)</i> “is not blank”, check each "
+callout_box("A typical workflow: add <i>ISSP Tags (ID or name)</i> to <i>Keywords</i> for <b>All records</b>, "
+            "then filter on <i>ISSP Tags (keywords)</i> or <i>ISSP Tags (similarity)</i> “is not blank”, check each "
             "record, and add the tags you agree with for the <b>Selected record</b>.", "Tip")
 H2("11.2 The review queue")
 P("The review window shows one record at a time and compares the record's own values with the values "

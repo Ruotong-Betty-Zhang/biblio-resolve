@@ -86,11 +86,12 @@ d._close()
 open_file(r, os.path.join(DEMO, "ISSP_sample_issp_module_tags.ris"))
 pump(app, 0.5)
 for column in r.column_vars:
-    r.column_vars[column].set(column in ("Title", "Keywords", "ISSP Tags (high)", "ISSP Tags (medium)",
-                                         "ISSP Tags (low)"))
+    r.column_vars[column].set(column in ("Title", "Keywords", "ISSP Tags (ID or name)", "ISSP Tags (keywords)",
+                                         "ISSP Tags (similarity)"))
 r.render_page()
 # The capture hides "match by meaning" (as the exe does), so the demo may have no low column.
-source = next(c for c in ("ISSP Tags (low)", "ISSP Tags (medium)", "ISSP Tags (high)") if c in r.df.columns)
+source = next(c for c in ("ISSP Tags (similarity)", "ISSP Tags (keywords)", "ISSP Tags (ID or name)")
+              if c in r.df.columns)
 r.add_source.set(source); r.add_target.set("Keywords"); r.add_scope.set(r.SELECTED_SCOPE)
 tagged = [i for i, v in enumerate(r.df[source].fillna("")) if str(v).strip()] or [0]
 r.table.tree.selection_set(str(tagged[0])); r.select_row(tagged[0])

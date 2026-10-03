@@ -121,11 +121,13 @@ class IsspModuleTagsTests(unittest.TestCase):
         self.assertEqual(result["confidence"], "high")
         self.assertEqual(result["method"], "exact_module_name")
 
-    def test_religion_environment_social_networks_count_standalone(self):
+    def test_exact_module_names_count_standalone(self):
+        # Every exact module name counts on its own, including Citizenship
+        # and National Identity - except "religion" / "environment".
         for text, expected in [
-                ("This paper is broadly about religion in modern society.", "RELIG"),
-                ("Attitudes toward the environment in Europe.", "ENV"),
-                ("Social networks and wellbeing in later life.", "SOCNET")]:
+                ("Social networks and wellbeing in later life.", "SOCNET"),
+                ("This paper is broadly about citizenship in modern society.", "CIT"),
+                ("This paper is broadly about national identity in Asia.", "NATID")]:
             result = first(tagger.classify_record(text))
             self.assertEqual(result["tag"], expected)
             self.assertEqual(result["confidence"], "high")
@@ -136,39 +138,58 @@ class IsspModuleTagsTests(unittest.TestCase):
         result = tagger.classify_record("A short note on environmental law.")
         self.assertEqual(tags_of(result), [])
 
-    def test_generic_name_alone_is_not_promoted_to_high(self):
-        # "Citizenship" / "National Identity" alone are ordinary vocabulary
-        # - must not be treated as an exact-name hit without ISSP nearby.
-        for text in ["This paper is broadly about citizenship in modern society.",
-                     "This paper is broadly about national identity in Asia."]:
+    def test_religion_environment_alone_are_not_promoted_to_high(self):
+        # The bare words are everyday vocabulary: without ISSP nearby they
+        # are no exact-name hit.
+        for text in ["This paper is broadly about religion in modern society.",
+                     "Attitudes toward the environment in Europe."]:
             self.assertEqual(tags_of(tagger.classify_record(text)), [])
 
-    def test_generic_name_near_issp_is_high_confidence(self):
-        result = first(tagger.classify_record(
-            "This paper uses the ISSP Citizenship module for its analysis."))
-        self.assertEqual(result["tag"], "CIT")
-        self.assertEqual(result["confidence"], "high")
-        self.assertEqual(result["method"], "exact_module_name")
+    def test_religion_environment_near_issp_are_high_confidence(self):
+        for text, expected in [
+                ("This paper uses the ISSP Religion module for its analysis.", "RELIG"),
+                ("Attitudes toward the environment, using ISSP 2020 data.", "ENV")]:
+            result = first(tagger.classify_record(text))
+            self.assertEqual(result["tag"], expected)
+            self.assertEqual(result["confidence"], "high")
+            self.assertEqual(result["method"], "exact_module_name")
 
-    def test_generic_name_near_spelled_out_issp_name_is_also_high_confidence(self):
+    def test_word_forms_near_issp_are_medium_confidence(self):
+        for text, expected in [
+                ("We compare religious attendance across countries with ISSP data.", "RELIG"),
+                ("Religiosity in Europe, using the ISSP.", "RELIG"),
+                ("Environmental concern in the ISSP surveys.", "ENV")]:
+            result = first(tagger.classify_record(text))
+            self.assertEqual(result["tag"], expected)
+            self.assertEqual(result["confidence"], "medium")
+            self.assertEqual(result["method"], "module_word_form")
+
+    def test_name_near_spelled_out_issp_name_is_also_high_confidence(self):
         # Formal reports often spell out the name on first mention instead
         # of using the acronym - this must count just as much as "ISSP".
         result = first(tagger.classify_record(
             "This study uses the International Social Survey Programme "
-            "National Identity module for its analysis."))
-        self.assertEqual(result["tag"], "NATID")
+            "Religion module for its analysis."))
+        self.assertEqual(result["tag"], "RELIG")
         self.assertEqual(result["confidence"], "high")
-        self.assertEqual(result["method"], "exact_module_name")
 
         result = first(tagger.classify_record(
             "This study uses the International Social Survey Program "
-            "National Identity module for its analysis."))  # American spelling
-        self.assertEqual(result["tag"], "NATID")
+            "Environment module for its analysis."))  # American spelling
+        self.assertEqual(result["tag"], "ENV")
 
-    def test_generic_name_far_from_issp_does_not_count(self):
-        far_text = "ISSP data. " + ("filler word " * 40) + "This is about citizenship."
-        result = tagger.classify_record(far_text)
+    def test_religion_in_another_sentence_does_not_count(self):
+        result = tagger.classify_record("We use ISSP data. This paper is about religion in Europe.")
         self.assertEqual(tags_of(result), [])
+
+    def test_module_word_in_the_same_sentence_also_counts(self):
+        result = first(tagger.classify_record(
+            "Attitudes from the 2018 religion module are compared across countries."))
+        self.assertEqual(result["tag"], "RELIG")
+        self.assertEqual(result["confidence"], "high")
+        result = first(tagger.classify_record("The environmental module shows rising concern."))
+        self.assertEqual(result["tag"], "ENV")
+        self.assertEqual(result["confidence"], "medium")
 
     # --- tier 2: scored keywords -----------------------------------------
 
@@ -458,7 +479,7 @@ class IsspModuleTagsTests(unittest.TestCase):
             df, text_columns=["Title", "Abstract"], tag_column="Keywords",
             use_network_doi_lookup=False, use_semantic_matching=False)
         # The module tag is only in the review columns; country tags still go in.
-        self.assertEqual(output_df.loc[0, "ISSP Tags (high)"], "RELIG")
+        self.assertEqual(output_df.loc[0, "ISSP Tags (ID or name)"], "RELIG")
         keywords = output_df.loc[0, "Keywords"].split("; ")
         self.assertNotIn("RELIG", keywords)
         self.assertIn("MYPROJECT", keywords)
@@ -484,9 +505,9 @@ class IsspModuleTagsTests(unittest.TestCase):
         self.assertIn("RELIG", output_df.loc[1, "Keywords"])  # ZA7570 = Religion III
 
         # One column per confidence level, for review.
-        self.assertEqual(output_df.loc[0, "ISSP Tags (low)"], "HLTH")
-        self.assertEqual(output_df.loc[0, "ISSP Tags (high)"], "")
-        self.assertEqual(output_df.loc[1, "ISSP Tags (high)"], "RELIG")
+        self.assertEqual(output_df.loc[0, "ISSP Tags (similarity)"], "HLTH")
+        self.assertEqual(output_df.loc[0, "ISSP Tags (ID or name)"], "")
+        self.assertEqual(output_df.loc[1, "ISSP Tags (ID or name)"], "RELIG")
 
         output_df, _stats, _column = tagger.tag_issp_modules(
             df, text_columns=["Title", "Abstract"], tag_column="Keywords",

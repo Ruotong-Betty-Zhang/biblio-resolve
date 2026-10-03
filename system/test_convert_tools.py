@@ -179,22 +179,22 @@ class RisPatchNoteColumnsTests(unittest.TestCase):
                 stream.write(ris)
             original = core.read_records_file(source)
             new = original.copy()
-            new["ISSP Tags (low)"] = ["HLTH; RELIG"]
+            new["ISSP Tags (similarity)"] = ["HLTH; RELIG"]
             self.assertTrue(core.write_ris_patch(source, original, new, target,
-                                                 note_columns=["ISSP Tags (low)"]))
+                                                 note_columns=["ISSP Tags (similarity)"]))
             loaded = core.read_records_file(target)
-            self.assertEqual(loaded.loc[0, "ISSP Tags (low)"], "HLTH; RELIG")
+            self.assertEqual(loaded.loc[0, "ISSP Tags (similarity)"], "HLTH; RELIG")
             self.assertEqual(loaded.loc[0, "Notes"], "A real note")
             # A second run replaces the carried value instead of adding another line.
             again = loaded.copy()
-            again["ISSP Tags (low)"] = ["SOCNET"]
+            again["ISSP Tags (similarity)"] = ["SOCNET"]
             second = os.path.join(folder, "out2.ris")
             self.assertTrue(core.write_ris_patch(target, loaded, again, second,
-                                                 note_columns=["ISSP Tags (low)"]))
+                                                 note_columns=["ISSP Tags (similarity)"]))
             with open(second, encoding="utf-8") as stream:
                 text = stream.read()
-        self.assertEqual(text.count("ISSP Tags (low)"), 1)
-        self.assertIn('ISSP Tags (low) = "SOCNET"', text)
+        self.assertEqual(text.count("ISSP Tags (similarity)"), 1)
+        self.assertIn('ISSP Tags (similarity) = "SOCNET"', text)
 
     def test_ris_writer_splits_only_plain_page_ranges(self):
         frame = pd.DataFrame({"Title": ["A", "B"], "Pages": ["12-34", "330-330 p."]})
@@ -208,33 +208,56 @@ class RisPatchNoteColumnsTests(unittest.TestCase):
         self.assertIn("SP  - 330-330 p.\n", text)
         self.assertEqual(list(loaded["Pages"]), ["12-34", "330-330 p."])
 
+    def test_old_issp_tag_column_names_read_and_save_under_new_names(self):
+        ris = ("TY  - JOUR\nTI  - A\nN1  - Literature Lookup field: ISSP Tags (high) = \"ENV\"\n"
+               "N1  - Literature Lookup field: ISSP Tags (low) = \"HLTH\"\nER  - \n")
+        new_names = ("ISSP Tags (ID or name)", "ISSP Tags (keywords)", "ISSP Tags (similarity)")
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = os.path.join(folder, "in.ris"), os.path.join(folder, "out.ris")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(ris)
+            original = core.read_records_file(source)
+            self.assertEqual(original.loc[0, "ISSP Tags (ID or name)"], "ENV")
+            self.assertEqual(original.loc[0, "ISSP Tags (similarity)"], "HLTH")
+            self.assertEqual(core.portable_columns_in_file(source),
+                             ["ISSP Tags (ID or name)", "ISSP Tags (similarity)"])
+            new = original.copy()
+            new["ISSP Tags (similarity)"] = ["SOCNET"]
+            self.assertTrue(core.write_ris_patch(source, original, new, target, note_columns=new_names))
+            with open(target, encoding="utf-8") as stream:
+                text = stream.read()
+        self.assertNotIn("(high)", text)
+        self.assertNotIn("(low)", text)
+        self.assertIn('ISSP Tags (ID or name) = "ENV"', text)
+        self.assertIn('ISSP Tags (similarity) = "SOCNET"', text)
+
     def test_portable_columns_in_file_lists_carried_columns(self):
-        ris = ("TY  - JOUR\nTI  - A\nN1  - Literature Lookup field: ISSP Tags (high) = \"ENV\"\nER  - \n\n"
-               "TY  - JOUR\nTI  - B\nN1  - Literature Lookup field: ISSP Tags (low) = \"HLTH\"\n"
-               "N1  - Literature Lookup field: ISSP Tags (high) = \"WORK\"\nER  - \n")
+        ris = ("TY  - JOUR\nTI  - A\nN1  - Literature Lookup field: ISSP Tags (ID or name) = \"ENV\"\nER  - \n\n"
+               "TY  - JOUR\nTI  - B\nN1  - Literature Lookup field: ISSP Tags (similarity) = \"HLTH\"\n"
+               "N1  - Literature Lookup field: ISSP Tags (ID or name) = \"WORK\"\nER  - \n")
         with tempfile.TemporaryDirectory() as folder:
             source = os.path.join(folder, "in.ris")
             with open(source, "w", encoding="utf-8") as stream:
                 stream.write(ris)
-            self.assertEqual(core.portable_columns_in_file(source), ["ISSP Tags (high)", "ISSP Tags (low)"])
+            self.assertEqual(core.portable_columns_in_file(source), ["ISSP Tags (ID or name)", "ISSP Tags (similarity)"])
         self.assertEqual(core.portable_columns_in_file("x.csv"), [])
 
     def test_note_edit_keeps_carried_columns(self):
         # A Note cleanup (e.g. Note Link Recovery) knows nothing about the
         # carried columns; rewriting the Notes must not drop their lines.
         ris = ("TY  - JOUR\nTI  - Paper\nN1  - <p>https://example.org/x. (ISSP)</p>\n"
-               "N1  - Literature Lookup field: ISSP Tags (high) = \"ENV\"\nER  - \n")
+               "N1  - Literature Lookup field: ISSP Tags (ID or name) = \"ENV\"\nER  - \n")
         with tempfile.TemporaryDirectory() as folder:
             source, target = os.path.join(folder, "in.ris"), os.path.join(folder, "out.ris")
             with open(source, "w", encoding="utf-8") as stream:
                 stream.write(ris)
             original = core.read_records_file(source)
-            self.assertEqual(original.loc[0, "ISSP Tags (high)"], "ENV")
+            self.assertEqual(original.loc[0, "ISSP Tags (ID or name)"], "ENV")
             new = original.copy()
             new.loc[0, "Notes"] = ""
             self.assertTrue(core.write_ris_patch(source, original, new, target))
             loaded = core.read_records_file(target)
-        self.assertEqual(loaded.loc[0, "ISSP Tags (high)"], "ENV")
+        self.assertEqual(loaded.loc[0, "ISSP Tags (ID or name)"], "ENV")
         self.assertNotIn("example.org", str(loaded.loc[0].get("Notes", "")))
 
 

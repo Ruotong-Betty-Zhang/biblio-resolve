@@ -21,12 +21,12 @@ Tiers, from most to least reliable:
      live against the DataCite API to read the title (which names the
      module) - requires network access.
    - The exact module name found verbatim (as whole words) in the text.
-     Ten of the twelve names count on their own. The other two
-     (Citizenship, National Identity) are also everyday political-science
-     vocabulary, so they only count here when they appear near an
-     explicit "ISSP" mention - otherwise they are left to the keyword
-     tier below.
-2. Medium confidence - scored keyword/topic matching: each module has a
+     Every name counts on its own except the single words "religion" and
+     "environment", which only count when the same sentence also says
+     "ISSP" (or the programme's full name) or "module".
+2. Medium confidence - a word form of "religion" / "environment"
+   ("religious", "religiosity", "environmental", ...) in a sentence that
+   also says "ISSP" or "module"; and scored keyword/topic matching: each module has a
    list of topic phrases, and a module only counts if it clears a minimum
    number of distinct phrase hits (a single incidental phrase like "job
    satisfaction" in an unrelated labour-economics paper should not, by
@@ -193,19 +193,23 @@ EXACT_MODULE_NAMES = {
     "social networks and social resources": "SOCNET",
     "social networks and support systems": "SOCNET",
     "social relations and support systems": "SOCNET",
-    "religion": "RELIG",
-    "environment": "ENV",
     "social networks": "SOCNET",
-}
-# These two module names double as everyday academic vocabulary, so
-# finding the bare word/phrase proves nothing on its own - it only counts
-# as exact-name evidence when it appears within ISSP_PROXIMITY_CHARS of an
-# explicit "ISSP" mention. Without that, they still get a fair shot via
-# the ordinary keyword tier below (TOPIC_KEYWORDS), just not promoted to
-# high confidence.
-EXACT_MODULE_NAMES_NEEDS_ISSP_NEARBY = {
     "citizenship": "CIT",
     "national identity": "NATID",
+}
+# These two single-word module names are everyday vocabulary, so the bare
+# word only counts as exact-name evidence in a sentence that also says
+# "ISSP" (or the programme's full name) or "module". Without that, they
+# still get a fair shot via the keyword tier below (TOPIC_KEYWORDS).
+EXACT_MODULE_NAMES_NEEDS_ISSP_NEARBY = {
+    "religion": "RELIG",
+    "environment": "ENV",
+}
+# Other word forms of those two names ("religious", "religiosity",
+# "environmental", ...) count as medium confidence under the same condition.
+MODULE_WORD_FORMS_NEEDS_ISSP_NEARBY = {
+    "RELIG": r"religio(?:us\w*|sit\w*|ns)",
+    "ENV": r"environment(?:al\w*|s)",
 }
 ISSP_PROXIMITY_CHARS = 120
 
@@ -346,7 +350,30 @@ def _name_near_issp(text, name, window=ISSP_PROXIMITY_CHARS):
     full name on first mention rather than the acronym - checked in both
     directions, or None. Used to gate the generic exact-module-names that
     are also everyday academic vocabulary."""
-    name_re = r"(?<!\w)" + re.escape(name) + r"(?!\w)"
+    return _regex_near_issp(text, re.escape(name), window)
+
+
+_SENTENCE_ANCHOR_RE = None  # compiled on first use (ISSP_ANCHOR_RE is defined below)
+
+
+def _word_in_issp_sentence(text, word_re):
+    """Span of the first whole-word match of `word_re` in a sentence that
+    also mentions ISSP (acronym or full name) or the word "module(s)"."""
+    global _SENTENCE_ANCHOR_RE
+    if _SENTENCE_ANCHOR_RE is None:
+        _SENTENCE_ANCHOR_RE = re.compile(ISSP_ANCHOR_RE + r"|\bmodules?\b", re.IGNORECASE)
+    word = re.compile(r"(?<!\w)(?:" + word_re + r")(?!\w)", re.IGNORECASE)
+    for start, end in sentence_spans(text):
+        sentence = text[start:end]
+        match = word.search(sentence)
+        if match and _SENTENCE_ANCHOR_RE.search(sentence):
+            return start + match.start(), start + match.end()
+    return None
+
+
+def _regex_near_issp(text, word_re, window=ISSP_PROXIMITY_CHARS):
+    """Like _name_near_issp, for a regular expression matched as whole words."""
+    name_re = r"(?<!\w)(?:" + word_re + r")(?!\w)"
     pattern = re.compile(
         ISSP_ANCHOR_RE + r".{0," + str(window) + "}" + name_re + "|" +
         name_re + r".{0," + str(window) + "}" + ISSP_ANCHOR_RE,
@@ -820,9 +847,11 @@ def resolve_gesis_doi_title(doi, session=None, timeout=15):
 _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
 # One column per confidence level with the module codes found at that level,
 # so a reviewer can add a whole level (or single records) to the keywords
-# with Review & Convert's "Add column values" tool.
-CONFIDENCE_TAG_COLUMNS = {"high": "ISSP Tags (high)", "medium": "ISSP Tags (medium)",
-                          "low": "ISSP Tags (low)"}
+# with Review & Convert's "Add values" tool. Each is named after the kind of
+# evidence behind it (lookup_core.LEGACY_COLUMN_NAMES maps the earlier
+# "(high)/(medium)/(low)" names onto these when an older file is read).
+CONFIDENCE_TAG_COLUMNS = {"high": "ISSP Tags (ID or name)", "medium": "ISSP Tags (keywords)",
+                          "low": "ISSP Tags (similarity)"}
 
 
 def classify_record(text, doi_resolver=None, embedding_matcher=None):
@@ -885,10 +914,16 @@ def classify_record(text, doi_resolver=None, embedding_matcher=None):
             add(tag, "high", "exact_module_name", f"Exact module name '{name}' found in text",
                 [match.span()])
     for name, tag in EXACT_MODULE_NAMES_NEEDS_ISSP_NEARBY.items():
-        span = _name_near_issp(text, name) if name in folded else None
+        span = _word_in_issp_sentence(text, re.escape(name)) if name in folded else None
         if span:
             add(tag, "high", "exact_module_name",
-                f"Exact module name '{name}' found near an ISSP mention", [span])
+                f"Exact module name '{name}' in a sentence mentioning ISSP or a module", [span])
+    for tag, word_re in MODULE_WORD_FORMS_NEEDS_ISSP_NEARBY.items():
+        span = _word_in_issp_sentence(text, word_re)
+        if span:
+            add(tag, "medium", "module_word_form",
+                f"A word form of '{'religion' if tag == 'RELIG' else 'environment'}' in a sentence "
+                "mentioning ISSP or a module", [span])
 
     # Tier 2: scored keywords - every module that independently clears the
     # minimum score, not only a unique winner.

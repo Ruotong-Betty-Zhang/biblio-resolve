@@ -1285,8 +1285,8 @@ def _style_chart_axes(figure, axes):
 class IsspModulePage(ctk.CTkFrame):
     # Segmented-button label -> tag_issp_modules(keyword_min_confidence=...)
     NO_KEYWORD_TIERS = "None (review later)"
-    KEYWORD_TIERS = {NO_KEYWORD_TIERS: None, "High": "high", "High + medium": "medium",
-                     "All (incl. low)": "low"}
+    KEYWORD_TIERS = {NO_KEYWORD_TIERS: None, "ID or name": "high", "+ keywords": "medium",
+                     "All (+ similarity)": "low"}
 
     def __init__(self, master):
         super().__init__(master, fg_color="transparent")
@@ -1358,7 +1358,7 @@ class IsspModulePage(ctk.CTkFrame):
         self.keyword_tiers.pack(side="left")
         ctk.CTkLabel(
             settings, justify="left", anchor="w", wraplength=760,
-            text="By default module tags go only into the ISSP Tags (high) / (medium) / (low) "
+            text="By default module tags go only into the ISSP Tags (ID or name) / (keywords) / (similarity) "
                  "columns, which are saved with the file; add them to the keywords later on the "
                  "Review & Convert page (\"Add values\"). \"DATA - <country>\" tags are always "
                  "added to the keywords. Existing keyword tags are never removed.").pack(
@@ -1490,8 +1490,8 @@ class IsspModulePage(ctk.CTkFrame):
                     self.run_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
                     self.export_btn.configure(state="normal")
                     self.status_var.set(
-                        "Classification complete. Module tags are in the ISSP Tags (high) / "
-                        "(medium) / (low) columns"
+                        "Classification complete. Module tags are in the ISSP Tags (ID or name) / "
+                        "(keywords) / (similarity) columns"
                         + ("" if self.run_keyword_tiers == self.NO_KEYWORD_TIERS else
                            f" and ({self.run_keyword_tiers}) in '{tag_column}'")
                         + f"; DATA country tags were added to '{tag_column}'. Export to save, then "
@@ -1836,7 +1836,7 @@ class ManualReviewPage(ctk.CTkFrame):
         filters.grid_columnconfigure(7, weight=1)
 
         # Copy one column's values into another, e.g. accept the module tags
-        # of "ISSP Tags (low)" into Keywords for the records you checked.
+        # of "ISSP Tags (similarity)" into Keywords for the records you checked.
         add_row = ctk.CTkFrame(main)
         add_row.pack(fill="x", pady=(0, 7))
         ctk.CTkLabel(add_row, text="Add values of", font=ctk.CTkFont(weight="bold")).pack(

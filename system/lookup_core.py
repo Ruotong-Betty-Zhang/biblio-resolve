@@ -2114,7 +2114,9 @@ def write_ris_patch(source_path, original_df, new_df, path, note_columns=()):
                                 len(kept))
             block = kept[:position] + [f"{write_tag}  - {value}" for value in values] + kept[position:]
         if note_columns:
-            prefixes = tuple(f"N1  - {_PORTABLE_FIELD_PREFIX}{column} = " for column in note_columns)
+            # Earlier lines for these columns, under their current or a former name.
+            names = set(note_columns) | {old for old, new in LEGACY_COLUMN_NAMES.items() if new in note_columns}
+            prefixes = tuple(f"N1  - {_PORTABLE_FIELD_PREFIX}{column} = " for column in names)
             block = [line for line in block if not line.startswith(prefixes)]
             carried = [f"N1  - {_PORTABLE_FIELD_PREFIX}{column} = "
                        f"{json.dumps(_patch_value(new_df.at[index, column]), ensure_ascii=False)}"
@@ -2233,6 +2235,12 @@ def _portable_columns_note(row, columns):
 
 
 _PORTABLE_FIELD_PREFIX = "Literature Lookup field: "
+# Columns renamed since files were saved: read under their current name.
+LEGACY_COLUMN_NAMES = {
+    "ISSP Tags (high)": "ISSP Tags (ID or name)",
+    "ISSP Tags (medium)": "ISSP Tags (keywords)",
+    "ISSP Tags (low)": "ISSP Tags (similarity)",
+}
 
 
 def portable_columns_in_file(path):
@@ -2247,7 +2255,8 @@ def portable_columns_in_file(path):
             for line in stream:
                 match = pattern.search(line)
                 if match:
-                    found.setdefault(match.group(1).strip(), None)
+                    name = match.group(1).strip()
+                    found.setdefault(LEGACY_COLUMN_NAMES.get(name, name), None)
     except OSError:
         return []
     return list(found)
@@ -2268,7 +2277,7 @@ def _restore_portable_columns(record):
             ordinary_notes.append(line)
             continue
         column, encoded = assignment.split(" = ", 1)
-        column = column.strip()
+        column = LEGACY_COLUMN_NAMES.get(column.strip(), column.strip())
         if not column:
             ordinary_notes.append(line)
             continue
